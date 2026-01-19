@@ -1,65 +1,71 @@
 # 🎨 KREDKI
-## Fast Secret Scanner for Linux (Context-Aware)
+## Szybki skaner sekretów dla systemów Linux (świadomy kontekstu bezpieczeństwa)
 
-**KREDKI** is an open‑source, context‑aware secret scanner for Linux systems.  
-It helps identify **passwords, API tokens, private keys and credentials**
-stored in files, focusing on **WHERE the secret is located**, not exploitation.
+**KREDKI** to narzędzie open‑source do wykrywania **haseł, tokenów API,
+kluczy prywatnych oraz innych sekretów** zapisanych w plikach na systemach Linux.
 
-> ⚠️ Scan only systems you own or have explicit permission to audit.
+W przeciwieństwie do klasycznych skanerów, KREDKI koncentruje się na
+**kontekście bezpieczeństwa**, a nie na exploitacji czy eskalacji uprawnień.
 
----
-
-## 🚀 Why KREDKI?
-
-Most tools only answer **“is there a secret?”**  
-KREDKI answers **“how dangerous is it?”**
-
-A password in `/root/.env` is not the same risk as one in `/tmp/test.txt`.
+> ⚠️ Uruchamiaj wyłącznie na systemach, które posiadasz lub masz wyraźną zgodę skanować.
 
 ---
 
-## ✨ Key Features
+## 🚀 Dlaczego KREDKI?
 
-- 🔍 Recursive filesystem scanning
-- ⚡ Ultra-fast search using **ripgrep**
-- 🧭 **Security Context**: HIGH / MEDIUM / LOW
-- 📂 Per-directory scan statistics (time & hits)
-- 🧩 Environment **profiles** (default / prod / dev / ctf)
-- 🛡️ **Safe Production Mode**
-- 🧾 **Redaction** for share-safe reports
-- 📄 **Security-ready HTML reports**
-- 🖥️ Clean TUI output (banner, spinner, summary)
+Większość narzędzi odpowiada tylko na pytanie:  
+**„Czy gdzieś istnieje sekret?”**
 
----
+KREDKI odpowiada na ważniejsze pytanie:  
+**„Jak bardzo to jest niebezpieczne?”**
 
-## 🧠 Security Context Explained
-
-| Level | Meaning | Examples |
-|----|----|----|
-| 🔴 HIGH | Critical system secrets | `/root`, `/etc`, `.env`, `.git-credentials` |
-| 🟠 MEDIUM | Application data | `/var`, `/home`, `/srv` |
-| 🟡 LOW | Temporary files | `/tmp`, `/var/tmp` |
-
-> Context is inferred **only from file location**, never from exploitation.
+Ten sam sekret w:
+- `/root/.env` → 🔴 **wysokie ryzyko**
+- `/tmp/test.txt` → 🟡 **niskie ryzyko**
 
 ---
 
-## 📸 Screenshots
+## ✨ Główne funkcje
 
-| What | Preview |
-|----|----|
-| CLI UI | [screenshots/ui.png](screenshots/ui.png) |
-| Scan Summary | [screenshots/summary.png](screenshots/summary.png) |
-| HTML Report | [screenshots/html_report.png](screenshots/html_report.png) |
-| Context Breakdown | [screenshots/context_breakdown.png](screenshots/context_breakdown.png) |
+- 🔍 Rekursywne skanowanie systemu plików
+- ⚡ Bardzo szybkie wyszukiwanie (ripgrep)
+- 🧭 **Kontekst bezpieczeństwa**: HIGH / MEDIUM / LOW
+- 📂 Statystyki per katalog (czas skanowania i liczba trafień)
+- 🧩 Profile środowisk (`default`, `prod`, `dev`, `ctf`)
+- 🛡️ **Tryb bezpieczny (Safe Production Mode)**
+- 🧾 **Redakcja sekretów** – raporty bezpieczne do udostępniania
+- 📄 **Raport HTML** gotowy do audytu bezpieczeństwa
+- 🖥️ Czytelny interfejs CLI (banner, spinner, podsumowanie)
 
 ---
 
-## 📦 Requirements
+## 🧠 Kontekst bezpieczeństwa – jak to działa?
+
+KREDKI **nie próbuje łamać systemu**.  
+Poziom ryzyka określany jest **wyłącznie na podstawie lokalizacji pliku**.
+
+| Poziom | Znaczenie | Przykłady |
+|------|-----------|----------|
+| 🔴 HIGH | Krytyczne sekrety systemowe | `/root`, `/etc`, `.env`, `.git-credentials` |
+| 🟠 MEDIUM | Dane aplikacyjne | `/var`, `/home`, `/srv` |
+| 🟡 LOW | Pliki tymczasowe | `/tmp`, `/var/tmp` |
+
+---
+
+## 📸 Zrzuty ekranu
+
+- Interfejs CLI → [screenshots/ui.png](screenshots/ui.png)
+- Podsumowanie skanu → [screenshots/summary.png](screenshots/summary.png)
+- Raport HTML → [screenshots/html_report.png](screenshots/html_report.png)
+- Breakdown kontekstu → [screenshots/context_breakdown.png](screenshots/context_breakdown.png)
+
+---
+
+## 📦 Wymagania
 
 - Linux
 - bash ≥ 4.x
-- ripgrep
+- `ripgrep`
 
 ```bash
 sudo apt install -y ripgrep
@@ -67,7 +73,7 @@ sudo apt install -y ripgrep
 
 ---
 
-## 📁 Installation
+## 📁 Instalacja
 
 ```bash
 git clone https://github.com/radektv/kredki.git
@@ -77,7 +83,7 @@ chmod +x kredki-ui.sh
 
 ---
 
-## ▶️ Basic Usage
+## ▶️ Podstawowe użycie
 
 ```bash
 ./kredki-ui.sh
@@ -85,48 +91,48 @@ chmod +x kredki-ui.sh
 
 ---
 
-## 🧪 Practical Examples (Cookbook)
+## 🧪 Przykłady użycia (CLI Cookbook)
 
-### 🔍 Scan selected directories
+### 🔍 Skan wybranych katalogów
 ```bash
 ./kredki-ui.sh --paths /etc,/home
 ```
 
-### 🛡️ Production-safe scan
+### 🛡️ Bezpieczny skan produkcyjny
 ```bash
 ./kredki-ui.sh --profile prod --safe
 ```
 
-### 📄 Generate HTML report
+### 📄 Generowanie raportu HTML
 ```bash
 ./kredki-ui.sh --html
 ```
 
-### 🧭 Context per FILE (recommended)
+### 🧭 Kontekst per PLIK (mniej szumu)
 ```bash
 ./kredki-ui.sh --context-mode file
 ```
 
-### 🧾 Redacted report (safe to share)
+### 🧾 Raport z redakcją sekretów (do udostępnienia)
 ```bash
 ./kredki-ui.sh --html --redact
 ```
 
-### 🤖 CI / automation
+### 🤖 Automaty / CI
 ```bash
 ./kredki-ui.sh --non-interactive --html --context-mode file
 ```
 
 ---
 
-## 📄 Reports
+## 📄 Raporty
 
-Generated files:
+Generowane pliki:
 - `kredki_found_YYYY-MM-DD_HH-MM-SS.txt`
 - `kredki_found_YYYY-MM-DD_HH-MM-SS.html`
 - `*.redacted.txt`
 
-CLI preview:
+Podgląd w terminalu:
 ```bash
 less -R kredki_found_*.txt
 w3m kredki_found_*.html
@@ -134,17 +140,17 @@ w3m kredki_found_*.html
 
 ---
 
-## 🔐 Security Notes
+## 🔐 Bezpieczeństwo
 
-- Reports may contain sensitive data
-- HTML is **redacted by default**
-- Recommended file permissions:
+- Raporty mogą zawierać dane wrażliwe
+- Raport HTML jest domyślnie **zredagowany**
+- Zalecane uprawnienia:
 ```bash
 chmod 600 kredki_found_*
 ```
 
 ---
 
-## 📜 License
+## 📜 Licencja
 
-MIT License – use responsibly.
+MIT License – używaj odpowiedzialnie.
