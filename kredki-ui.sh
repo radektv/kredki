@@ -1,13 +1,22 @@
 #!/bin/bash
 # ============================================================
 #  K R E D K I  – Fast Secret Scanner for Linux
-#  UI Wrapper (PRO+)
-#  Version : 1.0-prostats
+#  UI Wrapper (PRO+HTML+REPORT)
 #
-#  Adds:
-#   - per-directory scan time
-#   - per-directory hit counts
-#   - total time + total hits
+#  Features:
+#   - Profiles (profiles/*.conf): default, prod, dev, ctf
+#   - Safe production mode (--safe or SAFE_MODE=true in profile)
+#   - Security context (HIGH/MEDIUM/LOW) inferred from file location
+#   - Context mode: --context-mode line|file  (count per match line or per unique file)
+#   - Breakdown per context (HIGH/MEDIUM/LOW) with expandable lists
+#   - Redaction for safe sharing: --redact / --no-redact
+#     (HTML defaults to redacted unless --no-redact)
+#   - HTML report: --html  (security-ready, filters + collapsible sections)
+#
+#  Usage:
+#    ./kredki-ui.sh --paths /var --non-interactive --html
+#    ./kredki-ui.sh --profile prod --safe --html --context-mode file
+#    ./kredki-ui.sh --html --redact
 # ============================================================
 
 set -euo pipefail
@@ -20,73 +29,77 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
-
 SPINNER='|/-\'
 # ===============================================
 
-VERSION="1.0-prostats"
+VERSION="1.3-pro-html-redact-contextmode"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PATTERN_FILE="$SCRIPT_DIR/patterns.txt"
+PROFILES_DIR="$SCRIPT_DIR/profiles"
 
-# Must match scan paths used by kredki.sh
-SCAN_PATHS=(
-  /etc
-  /home
-  /root
-  /opt
-  /srv
-  /var
-)
+# Defaults (can be overridden by profiles)
+PROFILE_NAME="default"
+SCAN_PATHS=(/etc /home /root /opt /srv /var)
+MAX_FILE_SIZE="5M"
+SAFE_MODE=false
+FOLLOW_SYMLINKS=false
+ENABLE_SECURITY_CONTEXT=true
+ENABLE_HIGH_RISK=true
+ENABLE_MEDIUM_RISK=true
+ENABLE_LOW_RISK=true
 
-# Same excludes as kredki.sh
-EXCLUDES=(
+NON_INTERACTIVE=false
+NO_SPINNER=false
+
+# Reporting
+GENERATE_HTML=false
+HTML_FILE=""
+
+CONTEXT_MODE="line"        # line | file
+REDACT=false               # for TXT output (optional)
+REDACT_HTML_DEFAULT=true   # HTML is redacted by default
+
+# Exclusions (base)
+EXCLUDE_PATHS=(/proc /sys /dev)
+EXCLUDE_GLOBS=(
   --glob '!.git/*'
   --glob '!node_modules/*'
   --glob '!vendor/*'
-  --glob '!*.log'
-  --glob '!*.bin'
-  --glob '!*.zip'
 )
 
-# ================== FUNCTIONS ==================
+# ================== HELPERS ==================
 
-banner() {
-  clear
-  echo -e "${CYAN}${BOLD}"
-  cat << EOF
+usage() {
+  cat << 'EOF'
+KREDKI UI (PRO+HTML+REPORT)
 
-██   ██    ██████    ███████    ██████    ██   ██    ██
-██  ██     ██   ██   ██         ██   ██   ██  ██     ██
-█████      ██████    █████      ██   ██   █████      ██
-██  ██     ██   ██   ██         ██   ██   ██  ██     ██
-██   ██    ██   ██   ███████    ██████    ██   ██    ██
+Options:
+  --profile <name>          Load profile from profiles/<name>.conf (default: default)
+  --safe                    Enable Safe Production Mode
+  --paths <csv>             Override scan paths, e.g. /etc,/home,/var
+  --max-filesize <size>     Override max file size for rg (e.g. 2M, 10M)
+  --follow-symlinks         Follow symlinks (rg --follow)
+  --no-spinner              Disable spinner
+  --non-interactive         Do not prompt "Press ENTER" (useful for CI)
 
+  --context-mode <mode>     line (default) or file (unique files per context)
+  --redact                  Redact secrets in TXT + HTML reports
+  --no-redact               Disable redaction (HTML + TXT)
 
-              K   R   E   D   K   I
-        🔍 Fast Secret Scanner for Linux
-              Version ${VERSION}
+  --html                    Generate HTML report next to TXT
+  --html-file <path>        Custom HTML report path
 
+  -h, --help                Show this help
+
+Examples:
+  ./kredki-ui.sh --paths /var --non-interactive --html
+  ./kredki-ui.sh --profile prod --safe --html --context-mode file
+  ./kredki-ui.sh --html --redact
 EOF
-  echo -e "${NC}"
 }
 
-check_deps() {
-  for bin in rg; do
-    if ! command -v "$bin" &>/dev/null; then
-      echo -e "${RED}[✘] Missing dependency: $bin${NC}"
-      echo -e "${YELLOW}Install on Debian/Ubuntu:${NC} sudo apt install -y ripgrep"
-      exit 1
-    fi
-  done
-}
-
-check_patterns() {
-  if [[ ! -f "$PATTERN_FILE" ]]; then
-    echo -e "${RED}[✘] Missing patterns file:${NC} $PATTERN_FILE"
-    exit 1
-  fi
-}
+die() { echo -e "${RED}[✘]${NC} $*" >&2; exit 1; }
 
 format_duration() {
   local seconds="${1:-0}"
@@ -100,22 +113,30 @@ format_duration() {
   fi
 }
 
-print_scan_paths() {
-  echo -e "${BOLD}📁 Scan paths (configured):${NC}"
-  for dir in "${SCAN_PATHS[@]}"; do
-    echo -e "  • $dir"
-  done
-}
+banner() {
+  clear || true
+  echo -e "${CYAN}${BOLD}"
+  cat << EOF
 
-get_existing_scan_paths() {
-  for dir in "${SCAN_PATHS[@]}"; do
-    [[ -d "$dir" ]] && echo "$dir"
-  done
+██   ██    ██████    ███████    ██████    ██   ██    ██
+██  ██     ██   ██   ██         ██   ██   ██  ██     ██
+█████      ██████    █████      ██   ██   █████      ██
+██  ██     ██   ██   ██         ██   ██   ██  ██     ██
+██   ██    ██   ██   ███████    ██████    ██   ██    ██
+
+
+              K   R   E   D   K   I
+        🔍 Fast Secret Scanner for Linux
+     Version ${VERSION}
+
+EOF
+  echo -e "${NC}"
 }
 
 spinner() {
   local pid=$1
   local i=0
+  [[ "$NO_SPINNER" == "true" ]] && return 0
   tput civis || true
   while kill -0 "$pid" 2>/dev/null; do
     i=$(( (i+1) %4 ))
@@ -126,205 +147,475 @@ spinner() {
   printf "\r${GREEN}[✔] Scan completed successfully!          ${NC}\n"
 }
 
-# Run scan sequentially per directory to measure per-dir time precisely.
+check_deps() {
+  command -v rg >/dev/null 2>&1 || die "Missing dependency: rg (ripgrep). Install: sudo apt install -y ripgrep"
+  command -v awk >/dev/null 2>&1 || die "Missing dependency: awk"
+  command -v sed >/dev/null 2>&1 || die "Missing dependency: sed"
+}
+
+check_patterns() {
+  [[ -f "$PATTERN_FILE" ]] || die "Missing patterns file: $PATTERN_FILE"
+}
+
+csv_to_array() {
+  local csv="$1"
+  local IFS=','; read -r -a _arr <<< "$csv"
+  printf '%s\n' "${_arr[@]}"
+}
+
+load_profile() {
+  local name="$1"
+  local file="$PROFILES_DIR/$name.conf"
+
+  if [[ ! -d "$PROFILES_DIR" ]]; then
+    [[ "$name" == "default" ]] || die "Profiles directory not found: $PROFILES_DIR (requested profile: $name)"
+    return 0
+  fi
+
+  if [[ ! -f "$file" ]]; then
+    [[ "$name" == "default" ]] || die "Profile not found: $file"
+    return 0
+  fi
+
+  # shellcheck disable=SC1090
+  source "$file"
+  PROFILE_NAME="${PROFILE_NAME:-$name}"
+}
+
+apply_safe_mode() {
+  [[ "$SAFE_MODE" == "true" ]] || return 0
+
+  MAX_FILE_SIZE="${MAX_FILE_SIZE:-2M}"
+  FOLLOW_SYMLINKS=false
+  ENABLE_LOW_RISK=false
+  EXCLUDE_PATHS+=(/tmp /var/tmp)
+
+  for p in "${SCAN_PATHS[@]}"; do
+    [[ "$p" == "/" ]] && die "SAFE_MODE=true forbids scanning '/' (too risky). Use a narrower path set."
+  done
+}
+
+get_existing_scan_paths() {
+  local p
+  for p in "${SCAN_PATHS[@]}"; do
+    [[ -d "$p" ]] && echo "$p"
+  done
+}
+
+print_config() {
+  echo -e "${BOLD}Configuration:${NC}"
+  echo -e "🏷️  Profile          : ${CYAN}${PROFILE_NAME}${NC}"
+  echo -e "🧠 CPU cores        : $(nproc)"
+  echo -e "📜 Patterns         : $(basename "$PATTERN_FILE")"
+  echo -e "📦 Max file size    : ${MAX_FILE_SIZE}"
+  echo -e "🛡️  Safe mode        : ${SAFE_MODE}"
+  echo -e "🔗 Follow symlinks  : ${FOLLOW_SYMLINKS}"
+  echo -e "🧭 Security context : ${ENABLE_SECURITY_CONTEXT} (mode: ${CONTEXT_MODE})"
+  echo -e "🧾 HTML report       : ${GENERATE_HTML}"
+  echo -e "🧽 Redaction         : TXT=${REDACT} | HTML=${HTML_REDACT}"
+  echo
+
+  echo -e "${BOLD}📁 Scan paths (configured):${NC}"
+  for p in "${SCAN_PATHS[@]}"; do echo -e "  • $p"; done
+  echo
+
+  echo -e "${BOLD}🚫 Excluded paths:${NC}"
+  for p in "${EXCLUDE_PATHS[@]}"; do echo -e "  • $p"; done
+  echo
+}
+
+ctx_for_path() {
+  local f="$1"
+  if [[ "$f" == /etc/* || "$f" == /root/* || "$f" == /opt/* ]]; then echo "HIGH"; return; fi
+  if [[ "$f" == */.env || "$f" == */.env.* || "$f" == */.git-credentials || "$f" == */.npmrc || "$f" == */.pypirc ]]; then echo "HIGH"; return; fi
+  if [[ "$f" == /tmp/* || "$f" == /var/tmp/* || "$f" == /dev/shm/* ]]; then echo "LOW"; return; fi
+  echo "MEDIUM"
+}
+
+redact_line() {
+  local line="$1"
+  local file="${line%%:*}"
+  local rest="${line#*:}"
+  local lineno="${rest%%:*}"
+  local content="${rest#*:}"
+
+  local redacted
+  redacted="$(printf '%s' "$content" | sed -E     -e 's/((password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key)[[:space:]]*[:=][[:space:]]*)(["\x27`]?)[^"\x27` ,;)]*/\1\3<REDACTED>/Ig'     -e 's/(\b(authorization|bearer)[[:space:]]+)[A-Za-z0-9._-]+/\1<REDACTED>/Ig'     -e 's/([A-Z0-9_]{6,}_(TOKEN|SECRET|PASSWORD|KEY)[A-Z0-9_]*[[:space:]]*[:=][[:space:]]*)(["\x27`]?)[^"\x27` ,;)]*/\1\3<REDACTED>/g'   )"
+
+  printf '%s:%s:%s\n' "$file" "$lineno" "$redacted"
+}
+
 run_scan() {
   local out_file="$1"; shift
   local -a dirs=("$@")
-
-  local cpu rg_threads
-  cpu="$(nproc)"
-  rg_threads="$cpu"
-
-  # stats arrays (keyed by index)
-  declare -ga DIR_NAMES=()
-  declare -ga DIR_SECONDS=()
-  declare -ga DIR_HITS=()
+  local cpu; cpu="$(nproc)"
 
   : > "$out_file"
   chmod 600 "$out_file"
 
   {
     echo "[*] Start scan: $(date)"
-    echo "[*] CPU: $cpu | rg threads: $rg_threads"
-    echo "[*] Patterns: $PATTERN_FILE"
+    echo "[*] CPU: $cpu | rg threads: $cpu"
+    echo "[*] Profile: $PROFILE_NAME"
+    echo "[*] Safe mode: $SAFE_MODE"
+    echo "[*] Max file size: $MAX_FILE_SIZE"
     echo
   } >> "$out_file"
 
   local total_start total_end total_s
   total_start=$(date +%s)
 
+  local d
   for d in "${dirs[@]}"; do
     local start end dur hits
     start=$(date +%s)
 
-    # Header per directory (kept as [*] so it won't be counted as a hit)
-    {
-      echo "[*] --- Scanning: $d ---"
-      echo "[*] Start: $(date)"
-    } >> "$out_file"
+    local ex skip=false
+    for ex in "${EXCLUDE_PATHS[@]}"; do
+      if [[ "$d" == "$ex" || "$d" == "$ex/"* ]]; then skip=true; break; fi
+    done
+    [[ "$skip" == "true" ]] && continue
 
-    # Perform scan. Ignore rg exit code 1 (no matches).
-    # Exit codes: 0 matches found, 1 no matches, 2 error.
-    if rg -i \
-        --threads "$rg_threads" \
-        --no-heading \
-        --line-number \
-        -f "$PATTERN_FILE" \
-        "${EXCLUDES[@]}" \
-        "$d" >> "$out_file"; then
-      :
-    else
+    local tmp; tmp="$(mktemp)"
+
+    { echo "[*] --- Scanning: $d ---"; echo "[*] Start: $(date)"; } >> "$out_file"
+
+    local -a rg_args=(-i --threads "$cpu" --no-heading --line-number --max-filesize "$MAX_FILE_SIZE" -f "$PATTERN_FILE")
+    [[ "$FOLLOW_SYMLINKS" == "true" ]] && rg_args+=(--follow) || rg_args+=(--no-follow)
+    rg_args+=("${EXCLUDE_GLOBS[@]}")
+
+    if rg "${rg_args[@]}" "$d" > "$tmp"; then :; else
       rc=$?
-      if [[ $rc -ne 1 ]]; then
-        echo "[!] rg error (exit $rc) while scanning $d" >> "$out_file"
-      fi
+      [[ $rc -ne 1 ]] && echo "[!] rg error (exit $rc) while scanning $d" >> "$out_file"
     fi
+
+    cat "$tmp" >> "$out_file"
 
     end=$(date +%s)
     dur=$((end - start))
+    hits=$(wc -l < "$tmp" | tr -d ' ')
 
-    # Count hits for this directory from the output file (lines starting with "dir/..." or "dir:...")
-    hits=$(grep -v '^\[' "$out_file" 2>/dev/null | awk -v p="$d" 'index($0, p"/")==1 || index($0, p":")==1 {c++} END{print c+0}')
-
-    DIR_NAMES+=("$d")
-    DIR_SECONDS+=("$dur")
-    DIR_HITS+=("$hits")
-
-    {
-      echo "[*] End: $(date)"
-      echo "[*] Duration: ${dur}s"
-      echo "[*] Hits: $hits"
-      echo
-    } >> "$out_file"
+    { echo; echo "[*] End: $(date)"; echo "[*] Duration: ${dur}s"; echo "[*] Hits: $hits"; echo; } >> "$out_file"
+    rm -f "$tmp"
   done
 
   total_end=$(date +%s)
   total_s=$((total_end - total_start))
 
-  {
-    echo "[+] Finished: $(date)"
-    echo "[+] Total duration: ${total_s}s"
-    echo "[+] Results saved in: $out_file"
-  } >> "$out_file"
+  { echo "[+] Finished: $(date)"; echo "[+] Total duration: ${total_s}s"; echo "[+] Results saved in: $out_file"; } >> "$out_file"
+}
+
+DIR_NAMES=(); DIR_SECONDS=(); DIR_HITS=()
+CTX_HIGH=0; CTX_MEDIUM=0; CTX_LOW=0
+BREAK_HIGH=(); BREAK_MEDIUM=(); BREAK_LOW=()
+declare -A SEEN_HIGH=(); declare -A SEEN_MEDIUM=(); declare -A SEEN_LOW=()
+
+parse_stats_from_output() {
+  local out_file="$1"
+  DIR_NAMES=(); DIR_SECONDS=(); DIR_HITS=()
+  CTX_HIGH=0; CTX_MEDIUM=0; CTX_LOW=0
+  BREAK_HIGH=(); BREAK_MEDIUM=(); BREAK_LOW=()
+  SEEN_HIGH=(); SEEN_MEDIUM=(); SEEN_LOW=()
+
+  while IFS= read -r line; do
+    case "$line" in
+      "[*] --- Scanning:"*) d="${line#'[*] --- Scanning: '}"; d="${d%' ---'}"; DIR_NAMES+=("$d") ;;
+      "[*] Duration:"*) s="${line#'[*] Duration: '}"; s="${s%s}"; DIR_SECONDS+=("$s") ;;
+      "[*] Hits:"*) h="${line#'[*] Hits: '}"; DIR_HITS+=("$h") ;;
+    esac
+  done < "$out_file"
+
+  [[ "$ENABLE_SECURITY_CONTEXT" == "true" ]] || return 0
+
+  while IFS= read -r m; do
+    [[ -z "$m" ]] && continue
+    file="${m%%:*}"
+    ctx="$(ctx_for_path "$file")"
+
+    if [[ "$CONTEXT_MODE" == "file" ]]; then
+      case "$ctx" in
+        HIGH)   [[ -z "${SEEN_HIGH[$file]+x}" ]] && { SEEN_HIGH["$file"]=1; BREAK_HIGH+=("$file"); [[ "$ENABLE_HIGH_RISK" == "true" ]] && ((++CTX_HIGH)); } ;;
+        MEDIUM) [[ -z "${SEEN_MEDIUM[$file]+x}" ]] && { SEEN_MEDIUM["$file"]=1; BREAK_MEDIUM+=("$file"); [[ "$ENABLE_MEDIUM_RISK" == "true" ]] && ((++CTX_MEDIUM)); } ;;
+        LOW)    [[ -z "${SEEN_LOW[$file]+x}" ]] && { SEEN_LOW["$file"]=1; BREAK_LOW+=("$file"); [[ "$ENABLE_LOW_RISK" == "true" ]] && ((++CTX_LOW)); } ;;
+      esac
+    else
+      case "$ctx" in
+        HIGH)   BREAK_HIGH+=("$m"); [[ "$ENABLE_HIGH_RISK" == "true" ]] && ((++CTX_HIGH)) ;;
+        MEDIUM) BREAK_MEDIUM+=("$m"); [[ "$ENABLE_MEDIUM_RISK" == "true" ]] && ((++CTX_MEDIUM)) ;;
+        LOW)    BREAK_LOW+=("$m"); [[ "$ENABLE_LOW_RISK" == "true" ]] && ((++CTX_LOW)) ;;
+      esac
+    fi
+  done < <(grep -v '^\[' "$out_file" 2>/dev/null || true)
+}
+
+total_hits_from_file() { grep -v '^\[' "$1" 2>/dev/null | wc -l | tr -d ' '; }
+
+print_context_rules() {
+  cat << 'EOF'
+Rules (inferred from file location; not an exploit signal):
+  HIGH   → /etc, /root, /opt  +  *.env, .git-credentials, .npmrc, .pypirc
+  MEDIUM → default for everything else (e.g., /var, /home, /srv)
+  LOW    → /tmp, /var/tmp, /dev/shm
+EOF
 }
 
 summary() {
-  local file="$1"
+  local out_file="$1"
   local total_s="$2"
-
-  local total_hits
-  total_hits=$(grep -v '^\[' "$file" 2>/dev/null | wc -l | tr -d ' ')
+  local total_hits; total_hits="$(total_hits_from_file "$out_file")"
 
   echo
   echo -e "${BOLD}📊 Scan Summary${NC}"
   echo -e "────────────────────────────────────────"
+  echo -e "🏷️  Profile            : ${CYAN}${PROFILE_NAME}${NC}"
   echo -e "🏷️  Version            : ${CYAN}${VERSION}${NC}"
-  echo -e "📁 Result file         : ${CYAN}${file}${NC}"
+  echo -e "📁 Result file         : ${CYAN}${out_file}${NC}"
   echo -e "⏱️  Total scan time     : ${YELLOW}$(format_duration "$total_s")${NC}"
   echo -e "🔐 Total findings       : ${YELLOW}${total_hits}${NC}"
   echo
 
-  echo -e "${BOLD}📂 Scanned directories (time / hits):${NC}"
-  if (( ${#DIR_NAMES[@]} == 0 )); then
-    echo -e "  ${YELLOW}(none — no configured paths exist on this system)${NC}"
-  else
-    local i
-    for i in "${!DIR_NAMES[@]}"; do
-      local d="${DIR_NAMES[$i]}"
-      local s="${DIR_SECONDS[$i]}"
-      local h="${DIR_HITS[$i]}"
-      printf "  • %b%s%b  —  %b%s%b  —  %b%s hits%b\n" \
-        "$CYAN" "$d" "$NC" \
-        "$YELLOW" "$(format_duration "$s")" "$NC" \
-        "$YELLOW" "$h" "$NC"
-    done
+  echo -e "${BOLD}📂 Directories (time / hits):${NC}"
+  for i in "${!DIR_NAMES[@]}"; do
+    printf "  • %b%s%b  —  %b%s%b  —  %b%s hits%b\n"       "$CYAN" "${DIR_NAMES[$i]}" "$NC"       "$YELLOW" "$(format_duration "${DIR_SECONDS[$i]}")" "$NC"       "$YELLOW" "${DIR_HITS[$i]}" "$NC"
+  done
+
+  if [[ "$ENABLE_SECURITY_CONTEXT" == "true" ]]; then
+    echo
+    echo -e "${BOLD}🧭 Security Context (mode: ${CONTEXT_MODE})${NC}"
+    echo -e "  🔴 HIGH   : ${YELLOW}${CTX_HIGH}${NC}"
+    echo -e "  🟠 MEDIUM : ${YELLOW}${CTX_MEDIUM}${NC}"
+    echo -e "  🟡 LOW    : ${YELLOW}${CTX_LOW}${NC}"
+    echo
+    print_context_rules | sed 's/^/  /'
+    echo
+    echo -e "${BOLD}🧩 Breakdown (top entries)${NC}"
+    local max_show=12
+    echo -e "  🔴 HIGH:"; for item in "${BREAK_HIGH[@]:0:$max_show}"; do echo "    - $item"; done; (( ${#BREAK_HIGH[@]} > max_show )) && echo "    ... (${#BREAK_HIGH[@]} total)"
+    echo -e "  🟠 MEDIUM:"; for item in "${BREAK_MEDIUM[@]:0:$max_show}"; do echo "    - $item"; done; (( ${#BREAK_MEDIUM[@]} > max_show )) && echo "    ... (${#BREAK_MEDIUM[@]} total)"
+    echo -e "  🟡 LOW:"; for item in "${BREAK_LOW[@]:0:$max_show}"; do echo "    - $item"; done; (( ${#BREAK_LOW[@]} > max_show )) && echo "    ... (${#BREAK_LOW[@]} total)"
   fi
 
   echo
-  if (( total_hits > 0 )); then
-    echo -e "${RED}⚠️  Action required:${NC} Review findings immediately."
-  else
-    echo -e "${GREEN}✅ No secrets detected.${NC}"
-  fi
+  (( total_hits > 0 )) && echo -e "${RED}⚠️  Action required:${NC} Review findings immediately." || echo -e "${GREEN}✅ No secrets detected.${NC}"
 }
 
-# ================== MAIN ==================
+html_escape() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+
+html_list_items() {
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    printf '<li><code>%s</code></li>\n' "$(printf '%s' "$line" | html_escape)"
+  done
+}
+
+generate_html_report() {
+  local out_file="$1" total_s="$2" html_out="$3"
+  local total_hits; total_hits="$(total_hits_from_file "$out_file")"
+
+  local dir_rows=""
+  for i in "${!DIR_NAMES[@]}"; do
+    dir_rows+=$'<tr><td><code>'"$(printf '%s' "${DIR_NAMES[$i]}" | html_escape)"$'</code></td><td>'"$(format_duration "${DIR_SECONDS[$i]}")"$'</td><td>'"${DIR_HITS[$i]}"$'</td></tr>\n'
+  done
+
+  local high_list medium_list low_list
+  high_list="$(printf '%s\n' "${BREAK_HIGH[@]:-}" | html_list_items || true)"
+  medium_list="$(printf '%s\n' "${BREAK_MEDIUM[@]:-}" | html_list_items || true)"
+  low_list="$(printf '%s\n' "${BREAK_LOW[@]:-}" | html_list_items || true)"
+
+  local findings_raw
+  if [[ "$HTML_REDACT" == "true" ]]; then
+    findings_raw="$(grep -v '^\[' "$out_file" 2>/dev/null | while IFS= read -r l; do redact_line "$l"; done | html_escape || true)"
+  else
+    findings_raw="$(grep -v '^\[' "$out_file" 2>/dev/null | html_escape || true)"
+  fi
+
+  local rules_html; rules_html="$(print_context_rules | html_escape | sed 's/$/<br>/' )"
+
+  cat > "$html_out" <<EOF
+<!doctype html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>KREDKI Report</title>
+<style>
+body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,Arial,sans-serif;margin:24px;line-height:1.35}
+.wrap{max-width:1120px;margin:0 auto}
+.muted{color:#666}
+.card{border:1px solid #ddd;border-radius:14px;padding:16px;margin:16px 0}
+.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}
+@media (max-width:900px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media (max-width:520px){.grid{grid-template-columns:1fr}}
+.pill{display:flex;gap:8px;align-items:center;padding:10px 12px;border-radius:999px;border:1px solid #e6e6e6;background:#fafafa}
+table{border-collapse:collapse;width:100%} th,td{border-bottom:1px solid #eee;text-align:left;padding:10px;vertical-align:top} th{background:#fafafa}
+code{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace}
+pre{background:#0b0f14;color:#e6edf3;border-radius:14px;padding:14px;overflow:auto;white-space:pre-wrap;word-break:break-word}
+.high{color:#b00020;font-weight:800}.med{color:#b26a00;font-weight:800}.low{color:#0b6e4f;font-weight:800}
+.btns{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px} button{border:1px solid #ddd;background:#fff;border-radius:10px;padding:8px 10px;cursor:pointer}
+button:hover{background:#f7f7f7}
+details{border:1px solid #eee;border-radius:14px;padding:12px;margin:10px 0;background:#fff} summary{cursor:pointer;font-weight:700}
+ul{margin:10px 0 0 18px}
+.warn{color:#7a4b00}
+</style></head><body><div class="wrap">
+<h1>🎨 KREDKI Report</h1>
+<div class="muted">Generated: $(date) • Version: ${VERSION} • Profile: ${PROFILE_NAME}</div>
+
+<div class="card">
+  <div class="grid">
+    <div class="pill">⏱️ <span>Total time</span> <b>$(format_duration "$total_s")</b></div>
+    <div class="pill">🔐 <span>Findings</span> <b>${total_hits}</b></div>
+    <div class="pill">🛡️ <span>Safe mode</span> <b>${SAFE_MODE}</b></div>
+    <div class="pill">📦 <span>Max file size</span> <b>${MAX_FILE_SIZE}</b></div>
+  </div>
+  <div class="btns">
+    <button onclick="filterCtx('ALL')">Show all</button>
+    <button onclick="filterCtx('HIGH')">HIGH only</button>
+    <button onclick="filterCtx('MEDIUM')">MEDIUM only</button>
+    <button onclick="filterCtx('LOW')">LOW only</button>
+  </div>
+  <div class="muted" style="margin-top:10px">
+    Context mode: <b>${CONTEXT_MODE}</b> • HTML redaction: <b>${HTML_REDACT}</b>
+  </div>
+</div>
+
+<div class="card"><h2>📂 Directories (time / hits)</h2>
+<table><thead><tr><th>Directory</th><th>Time</th><th>Hits</th></tr></thead><tbody>
+${dir_rows:-<tr><td colspan="3" class="muted">No directory stats available.</td></tr>}
+</tbody></table></div>
+
+<div class="card"><h2>🧭 Security Context</h2>
+<div class="muted" style="margin-bottom:10px">${rules_html}</div>
+<table><thead><tr><th>Level</th><th>Count</th></tr></thead><tbody>
+<tr class="ctx HIGH"><td class="high">HIGH</td><td>${CTX_HIGH}</td></tr>
+<tr class="ctx MEDIUM"><td class="med">MEDIUM</td><td>${CTX_MEDIUM}</td></tr>
+<tr class="ctx LOW"><td class="low">LOW</td><td>${CTX_LOW}</td></tr>
+</tbody></table>
+
+<details class="ctx HIGH"><summary><span class="high">HIGH</span> breakdown</summary><ul>${high_list:-<li class="muted">none</li>}</ul></details>
+<details class="ctx MEDIUM"><summary><span class="med">MEDIUM</span> breakdown</summary><ul>${medium_list:-<li class="muted">none</li>}</ul></details>
+<details class="ctx LOW"><summary><span class="low">LOW</span> breakdown</summary><ul>${low_list:-<li class="muted">none</li>}</ul></details>
+</div>
+
+<div class="card"><h2>🔎 Findings (raw matches)</h2>
+<div class="muted">Tip: share the HTML report with redaction enabled.</div>
+<pre>${findings_raw}</pre></div>
+
+<div class="muted warn">⚠️ This report may contain sensitive data. Share carefully.</div>
+</div>
+<script>
+function filterCtx(level){
+  const nodes = document.querySelectorAll('.ctx');
+  nodes.forEach(n=>{
+    if(level==='ALL'){ n.style.display=''; return; }
+    n.style.display = n.classList.contains(level) ? '' : 'none';
+  });
+}
+</script>
+</body></html>
+EOF
+}
+
+write_redacted_txt_copy() {
+  local src="$1" dst="$2"
+  : > "$dst"; chmod 600 "$dst"
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^\[ ]]; then echo "$line" >> "$dst"; else redact_line "$line" >> "$dst"; fi
+  done < "$src"
+}
+
+# ARG PARSER
+PROFILE_REQUESTED="default"
+OVERRIDE_PATHS_CSV=""
+OVERRIDE_MAX_FILESIZE=""
+OVERRIDE_FOLLOW_SYMLINKS=false
+OVERRIDE_GENERATE_HTML=false
+OVERRIDE_HTML_FILE=""
+OVERRIDE_CONTEXT_MODE=""
+OVERRIDE_REDACT=""
+OVERRIDE_NO_REDACT=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --profile) [[ $# -ge 2 ]] || die "--profile requires a value"; PROFILE_REQUESTED="$2"; shift 2 ;;
+    --safe) SAFE_MODE=true; shift ;;
+    --paths) [[ $# -ge 2 ]] || die "--paths requires a csv list"; OVERRIDE_PATHS_CSV="$2"; shift 2 ;;
+    --max-filesize) [[ $# -ge 2 ]] || die "--max-filesize requires a value"; OVERRIDE_MAX_FILESIZE="$2"; shift 2 ;;
+    --follow-symlinks) OVERRIDE_FOLLOW_SYMLINKS=true; shift ;;
+    --no-spinner) NO_SPINNER=true; shift ;;
+    --non-interactive) NON_INTERACTIVE=true; shift ;;
+    --context-mode) [[ $# -ge 2 ]] || die "--context-mode requires: line|file"; OVERRIDE_CONTEXT_MODE="$2"; shift 2 ;;
+    --redact) OVERRIDE_REDACT="true"; shift ;;
+    --no-redact) OVERRIDE_NO_REDACT=true; shift ;;
+    --html) OVERRIDE_GENERATE_HTML=true; shift ;;
+    --html-file) [[ $# -ge 2 ]] || die "--html-file requires a value"; OVERRIDE_HTML_FILE="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "Unknown option: $1 (use --help)" ;;
+  esac
+done
 
 banner
 check_deps
 check_patterns
+load_profile "$PROFILE_REQUESTED"
+
+# Apply overrides after profile
+[[ -n "$OVERRIDE_PATHS_CSV" ]] && mapfile -t SCAN_PATHS < <(csv_to_array "$OVERRIDE_PATHS_CSV")
+[[ -n "$OVERRIDE_MAX_FILESIZE" ]] && MAX_FILE_SIZE="$OVERRIDE_MAX_FILESIZE"
+[[ "$OVERRIDE_FOLLOW_SYMLINKS" == "true" ]] && FOLLOW_SYMLINKS=true
+[[ "$OVERRIDE_GENERATE_HTML" == "true" ]] && GENERATE_HTML=true
+[[ -n "$OVERRIDE_HTML_FILE" ]] && HTML_FILE="$OVERRIDE_HTML_FILE"
+[[ -n "$OVERRIDE_CONTEXT_MODE" ]] && CONTEXT_MODE="$OVERRIDE_CONTEXT_MODE"
+[[ "$CONTEXT_MODE" != "line" && "$CONTEXT_MODE" != "file" ]] && die "--context-mode must be: line or file"
+
+# Redaction logic
+if [[ "$OVERRIDE_NO_REDACT" == "true" ]]; then
+  REDACT=false
+  HTML_REDACT=false
+else
+  REDACT="${OVERRIDE_REDACT:-false}"
+  HTML_REDACT="$REDACT_HTML_DEFAULT"
+fi
+[[ "$REDACT" == "true" ]] && HTML_REDACT=true
+
+apply_safe_mode
 
 mapfile -t EXISTING_DIRS < <(get_existing_scan_paths)
+print_config
 
-echo -e "${BOLD}Configuration:${NC}"
-echo -e "🧠 CPU cores      : $(nproc)"
-echo -e "📜 Regex patterns : patterns.txt"
-echo -e "🏷️  Version        : ${VERSION}"
-echo
-print_scan_paths
-echo
 echo -e "${BOLD}📂 Directories that will be scanned (exists):${NC}"
-if (( ${#EXISTING_DIRS[@]} == 0 )); then
-  echo -e "  ${YELLOW}(none found)${NC}"
-else
-  for d in "${EXISTING_DIRS[@]}"; do
-    echo -e "  • ${CYAN}${d}${NC}"
-  done
-fi
+for d in "${EXISTING_DIRS[@]}"; do echo -e "  • ${CYAN}${d}${NC}"; done
 
 echo
 echo -e "${YELLOW}⚠️  This scan may expose sensitive data.${NC}"
 echo -e "👉 Run only on systems you own or have permission to scan."
 echo
-read -rp "Press ENTER to start scanning..."
 
-OUT_FILE="$SCRIPT_DIR/kredki_found_$(date +%F_%H-%M-%S).txt"
-
-echo
-# Run scan in background to keep spinner UX
-(
-  run_scan "$OUT_FILE" "${EXISTING_DIRS[@]}"
-) &
-SCAN_PID=$!
-
-spinner "$SCAN_PID"
-
-# Read total duration from output file
-TOTAL_S_LINE=$(grep -E '^\[\+\] Total duration:' "$OUT_FILE" 2>/dev/null | tail -n1 | awk '{print $4}' | tr -d 's' || true)
-if [[ -n "${TOTAL_S_LINE:-}" ]]; then
-  TOTAL_S="$TOTAL_S_LINE"
-else
-  TOTAL_S=0
+if [[ "$NON_INTERACTIVE" != "true" ]]; then
+  read -rp "Press ENTER to start scanning..."
 fi
 
-# Rebuild per-dir stats from output file (so they're available in this shell)
-DIR_NAMES=()
-DIR_SECONDS=()
-DIR_HITS=()
+OUT_FILE="$SCRIPT_DIR/kredki_found_$(date +%F_%H-%M-%S).txt"
+echo
+( run_scan "$OUT_FILE" "${EXISTING_DIRS[@]}" ) &
+SCAN_PID=$!
+spinner "$SCAN_PID"
 
-while IFS= read -r line; do
-  case "$line" in
-    "[*] --- Scanning:"*)
-      d="${line#'[*] --- Scanning: '}"
-      d="${d%' ---'}"
-      DIR_NAMES+=("$d")
-      ;;
-    "[*] Duration:"*)
-      s="${line#'[*] Duration: '}"
-      s="${s%s}"
-      DIR_SECONDS+=("$s")
-      ;;
-    "[*] Hits:"*)
-      h="${line#'[*] Hits: '}"
-      DIR_HITS+=("$h")
-      ;;
-  esac
-done < "$OUT_FILE"
+TOTAL_S_LINE=$(grep -E '^\[\+\] Total duration:' "$OUT_FILE" 2>/dev/null | tail -n1 | awk '{print $4}' | tr -d 's' || true)
+TOTAL_S="${TOTAL_S_LINE:-0}"
 
+parse_stats_from_output "$OUT_FILE"
 summary "$OUT_FILE" "$TOTAL_S"
+
+if [[ "$REDACT" == "true" ]]; then
+  REDACT_TXT="${OUT_FILE%.txt}.redacted.txt"
+  write_redacted_txt_copy "$OUT_FILE" "$REDACT_TXT"
+  echo
+  echo -e "${GREEN}🧽 Redacted TXT:${NC} ${CYAN}${REDACT_TXT}${NC}"
+fi
+
+if [[ "$GENERATE_HTML" == "true" ]]; then
+  [[ -z "$HTML_FILE" ]] && HTML_FILE="${OUT_FILE%.txt}.html"
+  generate_html_report "$OUT_FILE" "$TOTAL_S" "$HTML_FILE"
+  echo -e "${GREEN}📄 HTML report:${NC} ${CYAN}${HTML_FILE}${NC}"
+fi
 
 echo
 echo -e "${BLUE}✨ Tip:${NC} Open the result file in a pager:"
 echo -e "   less -R $OUT_FILE"
 echo
-
