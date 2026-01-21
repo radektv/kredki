@@ -1,0 +1,43 @@
+# ============================================
+# KREDKI ignore file
+# Lines starting with # are comments
+# Empty lines are ignored
+#
+# Each entry matches FILE NAME (not full path)
+# Wildcards (*) are allowed
+#
+# Example:
+# README.md        -> ignores all README.md files
+# *.example        -> ignores any *.example files
+# ============================================
+
+# Documentation
+README
+README.md
+CHANGELOG
+CHANGELOG.md
+TODO
+TODO.md
+LICENSE
+LICENSE.txt
+
+# Docs / examples
+*.example
+*.sample
+*.template
+*.dist
+*.md
+
+# Tests
+*.spec
+*.test
+*_test.*
+
+# Vendor / dependencies docs
+node_modules
+vendor
+
+# CI examples
+.github
+.gitlab-ci.yml
+

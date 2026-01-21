@@ -3,11 +3,12 @@
 #  K R E D K I  – Fast Secret Scanner for Linux
 #  UI Wrapper (PRO+HTML+REPORT)
 #
-#  v1.4.1-pro-html-meta-exclude-self
-#   FIXES:
-#    - Proper ripgrep argument handling (no broken quoting) ✅
-#    - Clean, readable TXT report (separate from raw log) ✅
-#
+#  v1.8
+#   FIXES (v1.8):
+#    - HTML report generation is now reliable (no premature exit on bash arithmetic with set -e) ✅
+#    - HTML generator is nounset-safe (set -u disabled only inside HTML render) ✅
+#    - Security context blocks are precomputed & injected into HTML (Disk/Uptime/Network/Users now populated) ✅
+#    - HTML <pre> blocks forced readable (light text on dark background) ✅
 #  FEATURES:
 #   - File metadata (chmod/chown style) in TXT + HTML (optional)
 #   - Auto-exclude the KREDKI project directory from scans
@@ -28,7 +29,7 @@ NC='\033[0m'
 SPINNER='|/-\'
 # ===============================================
 
-VERSION="1.4.4-pro-html-meta-exclude-self-fqdn"
+VERSION="1.8"
 # Host identification (FQDN preferred)
 HOST_FQDN="$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo unknown-host)"
 # Make it filename-safe
@@ -64,6 +65,9 @@ REDACT_HTML_DEFAULT=true   # HTML is redacted by default
 # Permissions / ownership metadata
 INCLUDE_FILE_METADATA=true
 
+# Findings intelligence + permissions-aware risk
+ENABLE_INTEL=true
+
 # Exclusions (base)
 EXCLUDE_PATHS=(/proc /sys /dev)
 EXCLUDE_GLOBS=(
@@ -75,6 +79,13 @@ EXCLUDE_GLOBS=(
 # Auto-exclude project dir (this repo)
 AUTO_EXCLUDE_PROJECT_DIR=true
 PROJECT_DIR="$SCRIPT_DIR"
+
+# .kredkiignore (ignore by file/dir name, gitignore-like comments)
+IGNORE_ENABLED=true
+IGNORE_FILE_DEFAULT="$SCRIPT_DIR/.kredkiignore"
+IGNORE_FILE=""
+SHOW_IGNORED=false
+IGNORE_PATTERNS=()
 
 # ================== HELPERS ==================
 
@@ -100,6 +111,10 @@ Options:
 
   --file-metadata           Include chmod/chown-style metadata in TXT+HTML (default)
   --no-file-metadata        Disable file metadata sections
+
+  --ignore-file <path>       Use custom .kredkiignore file
+  --no-ignore                Disable .kredkiignore handling
+  --show-ignored             Print loaded ignore patterns in config
 
   -h, --help                Show this help
 
@@ -167,6 +182,125 @@ check_deps() {
 
 check_patterns() { [[ -f "$PATTERN_FILE" ]] || die "Missing patterns file: $PATTERN_FILE"; }
 
+get_os_pretty() {
+  if [[ -r /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    echo "${PRETTY_NAME:-unknown}"
+  else
+    echo "unknown"
+  fi
+}
+
+get_kernel() { uname -r 2>/dev/null || echo "unknown"; }
+
+get_cpu_info() {
+  local model cores
+  model="$(awk -F: '/model name/{print $2; exit}' /proc/cpuinfo 2>/dev/null | sed 's/^[ \t]*//')"
+  cores="$(nproc 2>/dev/null || echo '?')"
+  echo "${model:-unknown} (${cores} cores)"
+}
+
+get_ram_info() {
+  # total and free in human friendly
+  if command -v free >/dev/null 2>&1; then
+    free -h | awk 'NR==2{printf "Total: %s | Used: %s | Free: %s | Available: %s\n",$2,$3,$4,$7}'
+  else
+    # fallback from /proc/meminfo
+    local kb
+    kb="$(awk '/MemTotal/{print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+    echo "Total: $((kb/1024)) MB"
+  fi
+}
+
+get_partitions() {
+  if command -v df >/dev/null 2>&1; then
+    # show only real mounts, human-friendly
+    df -hT -x tmpfs -x devtmpfs 2>/dev/null || df -h 2>/dev/null
+  else
+    echo "df not available"
+  fi
+}
+
+get_uptime_pretty() {
+  if command -v uptime >/dev/null 2>&1; then
+    uptime -p 2>/dev/null || true
+  fi
+  # fallback
+  if [[ -r /proc/uptime ]]; then
+    local up s m h d
+    up="$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 0)"
+    d=$((up/86400)); h=$(( (up%86400)/3600 )); m=$(( (up%3600)/60 ))
+    if (( d > 0 )); then echo "up ${d} days, ${h} hours, ${m} minutes"; return; fi
+    if (( h > 0 )); then echo "up ${h} hours, ${m} minutes"; return; fi
+    echo "up ${m} minutes"
+  else
+    echo "unknown"
+  fi
+}
+
+get_ip_brief() {
+  if command -v ip >/dev/null 2>&1; then
+    ip -br a 2>/dev/null || true
+  else
+    echo "ip tool not available"
+  fi
+}
+
+get_users_summary() {
+  echo "Current user: $(id -un 2>/dev/null || echo unknown) (uid=$(id -u 2>/dev/null || echo ?))"
+  echo "Groups: $(id -Gn 2>/dev/null || true)"
+  if command -v who >/dev/null 2>&1; then
+    echo
+    echo "Logged-in users (who):"
+    who 2>/dev/null || true
+  fi
+  echo
+  echo "Users with shells (from /etc/passwd):"
+  awk -F: '($7 !~ /(nologin|false)$/){printf "%s (uid=%s, shell=%s)\n",$1,$3,$7}' /etc/passwd 2>/dev/null | head -n 30 || true
+}
+
+get_sudo_summary() {
+  if command -v sudo >/dev/null 2>&1; then
+    echo "sudo version: $(sudo -V 2>/dev/null | head -n 1 || true)"
+  fi
+  if [[ -r /etc/sudoers ]]; then
+    echo
+    echo "/etc/sudoers (non-comment lines):"
+    grep -E '^[[:space:]]*[^#[:space:]]' /etc/sudoers 2>/dev/null | head -n 80 || true
+  fi
+  if [[ -d /etc/sudoers.d ]]; then
+    echo
+    echo "/etc/sudoers.d (files):"
+    ls -1 /etc/sudoers.d 2>/dev/null | head -n 50 || true
+  fi
+}
+
+top_largest_files_with_findings() {
+  local limit="${1:-10}"
+  local tmp
+  tmp="$(mktemp)"
+  local f
+  for f in "${!UNIQUE_FILES[@]}"; do
+    [[ -e "$f" ]] || continue
+    # size in bytes
+    sz="$(stat -c '%s' "$f" 2>/dev/null || echo 0)"
+    printf "%s\t%s\n" "$sz" "$f" >> "$tmp"
+  done
+  sort -nr "$tmp" | head -n "$limit"
+  rm -f "$tmp"
+}
+
+human_bytes() {
+  local b="${1:-0}"
+  local kib=$((1024)); local mib=$((1024*1024)); local gib=$((1024*1024*1024))
+  if (( b >= gib )); then awk -v b="$b" 'BEGIN{printf "%.2fG", b/1024/1024/1024}'; return; fi
+  if (( b >= mib )); then awk -v b="$b" 'BEGIN{printf "%.2fM", b/1024/1024}'; return; fi
+  if (( b >= kib )); then awk -v b="$b" 'BEGIN{printf "%.2fK", b/1024}'; return; fi
+  printf "%sB" "$b"
+}
+
+
 csv_to_array() { local csv="$1"; local IFS=','; read -r -a _arr <<< "$csv"; printf '%s\n' "${_arr[@]}"; }
 
 load_profile() {
@@ -198,6 +332,48 @@ apply_safe_mode() {
   done
 }
 
+trim_ws() { sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'; }
+
+load_kredkiignore() {
+  IGNORE_PATTERNS=()
+  [[ "$IGNORE_ENABLED" == "true" ]] || return 0
+
+  local f="${IGNORE_FILE:-$IGNORE_FILE_DEFAULT}"
+  [[ -f "$f" ]] || return 0
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="$(printf '%s' "$line" | trim_ws)"
+    [[ -z "$line" ]] && continue
+    [[ "$line" == \#* ]] && continue
+    IGNORE_PATTERNS+=("$line")
+  done < "$f"
+
+  IGNORE_FILE="$f"
+}
+
+# Turn IGNORE_PATTERNS entries into ripgrep --glob excludes
+# Matches are primarily by basename; directories are excluded recursively.
+append_ignore_globs() {
+  local p
+  for p in "${IGNORE_PATTERNS[@]}"; do
+    # if contains path separators, treat as path glob directly
+    if [[ "$p" == *"/"* ]]; then
+      RG_ARGS+=(--glob "!${p}")
+      continue
+    fi
+
+    # wildcard / extension patterns: match by basename anywhere
+    if [[ "$p" == *"*"* || "$p" == *"?"* || "$p" == *"["* ]]; then
+      RG_ARGS+=(--glob "!**/${p}")
+      continue
+    fi
+
+    # plain name: exclude files and directories with this name
+    RG_ARGS+=(--glob "!**/${p}")
+    RG_ARGS+=(--glob "!**/${p}/**")
+  done
+}
+
 get_existing_scan_paths() { for p in "${SCAN_PATHS[@]}"; do [[ -d "$p" ]] && echo "$p"; done; }
 
 print_config() {
@@ -211,7 +387,13 @@ print_config() {
   echo -e "🧭 Security context   : ${ENABLE_SECURITY_CONTEXT} (mode: ${CONTEXT_MODE})"
   echo -e "🧾 HTML report         : ${GENERATE_HTML}"
   echo -e "🧽 Redaction           : TXT=${REDACT} | HTML=${HTML_REDACT}"
+  echo -e "🧠 Intel (tags/risk)   : ${ENABLE_INTEL}"
   echo -e "🔐 File metadata       : ${INCLUDE_FILE_METADATA}"
+  echo -e "🧹 .kredkiignore       : ${IGNORE_ENABLED} ${IGNORE_FILE:+(${IGNORE_FILE})}"
+  if [[ "$SHOW_IGNORED" == "true" && ${#IGNORE_PATTERNS[@]} -gt 0 ]]; then
+    echo -e "${BOLD}🧹 Ignore patterns:${NC}"
+    for p in "${IGNORE_PATTERNS[@]}"; do echo -e "  • $p"; done
+  fi
   echo
   echo -e "${BOLD}📁 Scan paths (configured):${NC}"
   for p in "${SCAN_PATHS[@]}"; do echo -e "  • $p"; done
@@ -280,6 +462,135 @@ file_meta() {
   printf '%s' "${META_CACHE[$f]}"
 }
 
+# -------- Permissions-aware risk helpers --------
+perm_flags() {
+  # echo: flags + octal
+  local f="$1"
+  local oct
+  oct="$(stat -c '%a' "$f" 2>/dev/null || echo '')"
+  if [[ -z "$oct" || "$oct" == "?" ]]; then
+    echo "unknown"
+    return 0
+  fi
+  local special="0"
+  local perms="$oct"
+  if [[ ${#oct} -eq 4 ]]; then
+    special="${oct:0:1}"
+    perms="${oct:1:3}"
+  fi
+  local u="${perms:0:1}" g="${perms:1:1}" o="${perms:2:1}"
+  local world_r=false group_r=false world_w=false suid=false sgid=false sticky=false
+  (( o & 4 )) && world_r=true
+  (( g & 4 )) && group_r=true
+  (( o & 2 )) && world_w=true
+  (( special & 4 )) && suid=true
+  (( special & 2 )) && sgid=true
+  (( special & 1 )) && sticky=true
+  echo "world_r=${world_r} group_r=${group_r} world_w=${world_w} suid=${suid} sgid=${sgid} sticky=${sticky} octal=${oct}"
+}
+
+# -------- Finding intelligence (heuristics) --------
+# Returns: TAGS|CONF|SEV (SEV 1..5)
+classify_content() {
+  local line="$1"
+  local rest="${line#*:}"; rest="${rest#*:}"
+  local c="$rest"
+
+  local tags=()
+  local conf="LOW"
+  local sev=2
+
+  if [[ "$c" =~ -----BEGIN[[:space:]](RSA|EC|OPENSSH|DSA)[[:space:]]PRIVATE[[:space:]]KEY----- ]]; then
+    tags+=("PRIVATE_KEY"); conf="HIGH"; sev=5
+  fi
+
+  if [[ "$c" =~ \b(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b ]]; then
+    tags+=("GITHUB_TOKEN"); conf="HIGH"; sev=5
+  fi
+
+  if [[ "$c" =~ \b(AKIA|ASIA)[A-Z0-9]{16}\b ]]; then
+    tags+=("AWS_ACCESS_KEY"); [[ "$conf" == "LOW" ]] && conf="MEDIUM"; (( sev < 4 )) && sev=4
+  fi
+
+  if [[ "$c" =~ ([A-Za-z0-9_-]{10,})\.([A-Za-z0-9_-]{10,})\.([A-Za-z0-9_-]{10,}) ]]; then
+    tags+=("JWT"); [[ "$conf" == "LOW" ]] && conf="MEDIUM"; (( sev < 4 )) && sev=4
+  fi
+
+  if [[ "$c" =~ ([Aa]uthorization|[Bb]earer)[[:space:]]*[:=]?[[:space:]]*[Bb]earer[[:space:]]+[A-Za-z0-9._=-]{12,} ]]; then
+    tags+=("BEARER_TOKEN"); [[ "$conf" == "LOW" ]] && conf="MEDIUM"; (( sev < 4 )) && sev=4
+  fi
+
+  if [[ "$c" =~ [A-Za-z0-9._%+-]{1,}:[^[:space:]]{1,}@ ]]; then
+    tags+=("BASIC_AUTH"); [[ "$conf" == "LOW" ]] && conf="MEDIUM"; (( sev < 3 )) && sev=3
+  fi
+
+  if [[ "$c" =~ (password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key)[[:space:]]*[:=][[:space:]]*[^[:space:]]{6,} ]]; then
+    tags+=("CREDENTIAL"); [[ "$conf" == "LOW" ]] && conf="MEDIUM"; (( sev < 3 )) && sev=3
+  fi
+
+  if [[ "$c" =~ (kubeconfig|client-certificate-data|client-key-data|docker|auths|gcloud|azure|aws_) ]]; then
+    tags+=("CLOUD"); (( sev < 3 )) && sev=3
+  fi
+
+  if (( ${#tags[@]} == 0 )); then
+    tags=("MATCH"); conf="LOW"; sev=2
+  fi
+
+  local uniq=()
+  local t
+  for t in "${tags[@]}"; do
+    if [[ " ${uniq[*]} " != *" ${t} "* ]]; then uniq+=("$t"); fi
+  done
+
+  local tag_str; tag_str="$(IFS=','; echo "${uniq[*]}")"
+  echo "${tag_str}|${conf}|${sev}"
+}
+
+risk_score_for_file() {
+  local file="$1" ctx="$2" sev="$3"
+  local flags; flags="$(perm_flags "$file")"
+  local score=0
+  case "$ctx" in
+    HIGH) score=$((score + 25)) ;;
+    MEDIUM) score=$((score + 15)) ;;
+    LOW) score=$((score + 5)) ;;
+  esac
+  score=$((score + sev * 10))
+  if [[ "$flags" != "unknown" ]]; then
+    [[ "$flags" == *"world_r=true"* ]] && score=$((score + 15))
+    [[ "$flags" == *"group_r=true"* ]] && score=$((score + 8))
+    [[ "$flags" == *"world_w=true"* ]] && score=$((score + 20))
+    [[ "$flags" == *"suid=true"* ]] && score=$((score + 10))
+    [[ "$flags" == *"sgid=true"* ]] && score=$((score + 6))
+    [[ "$flags" == *"sticky=true"* ]] && score=$((score - 2))
+  fi
+  (( score > 100 )) && score=100
+  (( score < 0 )) && score=0
+  echo "$score"
+}
+
+risk_label() {
+  local score="$1"
+  if (( score >= 80 )); then echo "CRITICAL"; return; fi
+  if (( score >= 60 )); then echo "HIGH"; return; fi
+  if (( score >= 35 )); then echo "MEDIUM"; return; fi
+  echo "LOW"
+}
+
+# Build "score<TAB>file" list sorted desc (requires FILE_RISK populated)
+top_risk_list() {
+  local limit="${1:-10}"
+  local tmp
+  tmp="$(mktemp)"
+  local f s
+  for f in "${!UNIQUE_FILES[@]}"; do
+    s="${FILE_RISK[$f]:-0}"
+    printf "%s\t%s\n" "$s" "$f" >> "$tmp"
+  done
+  sort -nr "$tmp" | head -n "$limit"
+  rm -f "$tmp"
+}
+
 # Build ripgrep args array for a scan root (FIXED: no broken quoting)
 RG_ARGS=()
 rg_args_for_root() {
@@ -292,10 +603,15 @@ rg_args_for_root() {
     --glob '!kredki_found_*.txt'
     --glob '!kredki_found_*.html'
     --glob '!*\.redacted\.txt'
+    --glob '!**/.kredkiignore'
   )
 
   [[ "$FOLLOW_SYMLINKS" == "true" ]] && RG_ARGS+=(--follow) || RG_ARGS+=(--no-follow)
   RG_ARGS+=("${EXCLUDE_GLOBS[@]}")
+  # Apply .kredkiignore patterns
+  if [[ "$IGNORE_ENABLED" == "true" && ${#IGNORE_PATTERNS[@]} -gt 0 ]]; then
+    append_ignore_globs
+  fi
 
   if [[ "$AUTO_EXCLUDE_PROJECT_DIR" == "true" ]]; then
     case "$PROJECT_DIR" in
@@ -354,6 +670,13 @@ BREAK_HIGH=(); BREAK_MEDIUM=(); BREAK_LOW=()
 declare -A SEEN_HIGH=(); declare -A SEEN_MEDIUM=(); declare -A SEEN_LOW=()
 declare -A UNIQUE_FILES=()
 declare -A FILE_HITS=()
+# Intelligence per file
+declare -A FILE_TAGS=()
+declare -A FILE_CONF=()
+declare -A FILE_SEV=()
+declare -A FILE_RISK=()
+declare -A FILE_CTX=()
+declare -A FILE_FLAGS=()
 
 total_hits_from_file() { wc -l < "$1" | tr -d ' '; }
 
@@ -381,6 +704,32 @@ parse_from_raw() {
     UNIQUE_FILES["$file"]=1
     FILE_HITS["$file"]=$(( ${FILE_HITS["$file"]:-0} + 1 ))
 
+    # Intelligence (tags/conf/severity) per match line -> aggregate per file
+    if [[ "$ENABLE_INTEL" == "true" ]]; then
+      local cls tag_str conf sev
+      cls="$(classify_content "$m")"
+      tag_str="${cls%%|*}"
+      conf="${cls#*|}"; conf="${conf%%|*}"
+      sev="${cls##*|}"
+
+      if [[ -n "${FILE_TAGS[$file]:-}" ]]; then
+        FILE_TAGS["$file"]="${FILE_TAGS[$file]},${tag_str}"
+      else
+        FILE_TAGS["$file"]="${tag_str}"
+      fi
+
+      if [[ -z "${FILE_SEV[$file]:-}" || "$sev" -gt "${FILE_SEV[$file]}" ]]; then
+        FILE_SEV["$file"]="$sev"
+      fi
+
+      local cur="${FILE_CONF[$file]:-LOW}"
+      case "$cur" in
+        HIGH) : ;;
+        MEDIUM) [[ "$conf" == "HIGH" ]] && FILE_CONF["$file"]="$conf" ;;
+        LOW) FILE_CONF["$file"]="$conf" ;;
+      esac
+    fi
+
     [[ "$ENABLE_SECURITY_CONTEXT" == "true" ]] || continue
     local ctx; ctx="$(ctx_for_path "$file")"
 
@@ -397,7 +746,32 @@ parse_from_raw() {
         LOW)    BREAK_LOW+=("$m"); [[ "$ENABLE_LOW_RISK" == "true" ]] && ((++CTX_LOW)) ;;
       esac
     fi
-  done < "$raw_file"
+    # Finalize intelligence + risk per file
+  if [[ "$ENABLE_INTEL" == "true" ]]; then
+    local f
+    for f in "${!UNIQUE_FILES[@]}"; do
+      local ctx sev score flags
+      ctx="$(ctx_for_path "$f")"
+      sev="${FILE_SEV[$f]:-2}"
+      score="$(risk_score_for_file "$f" "$ctx" "$sev")"
+      flags="$(perm_flags "$f")"
+      FILE_CTX["$f"]="$ctx"
+      FILE_RISK["$f"]="$score"
+      FILE_FLAGS["$f"]="$flags"
+
+      local raw="${FILE_TAGS[$f]:-MATCH}"
+      local IFS=','; read -r -a arr <<< "$raw"
+      local uniq=()
+      local t
+      for t in "${arr[@]}"; do
+        [[ -z "$t" ]] && continue
+        if [[ " ${uniq[*]} " != *" ${t} "* ]]; then uniq+=("$t"); fi
+      done
+      FILE_TAGS["$f"]="$(IFS=','; echo "${uniq[*]}")"
+      [[ -z "${FILE_CONF[$f]:-}" ]] && FILE_CONF["$f"]="LOW"
+    done
+  fi
+done < "$raw_file" || true
 }
 
 # Per-directory stats (time + hits)
@@ -446,14 +820,32 @@ write_report_txt() {
 
   local total_hits; total_hits="$(total_hits_from_file "$raw_file")"
 
+  # Precompute system/context blocks defensively (avoid set -e aborting HTML generation)
+  local os_pretty="" kernel="" cpu="" ram="" uptime="" ip="" users="" sudo_summary="" partitions=""
+  os_pretty="$(get_os_pretty 2>/dev/null | html_escape || true)"
+  kernel="$(get_kernel 2>/dev/null | html_escape || true)"
+  cpu="$(get_cpu_info 2>/dev/null | html_escape || true)"
+  ram="$(get_ram_info 2>/dev/null | html_escape || true)"
+  uptime="$(get_uptime_pretty 2>/dev/null | html_escape || true)"
+  ip="$(get_ip_brief 2>/dev/null | html_escape || true)"
+  users="$(get_users_summary 2>/dev/null | html_escape || true)"
+  sudo_summary="$(get_sudo_summary 2>/dev/null | html_escape || true)"
+  partitions="$(get_partitions 2>/dev/null | html_escape || true)"
+
   : > "$report_file"
   chmod 600 "$report_file"
 
   {
     echo "KREDKI Report"
     echo "Version: $VERSION"
+    echo "Release notes: v1.8 – HTML generation fixed (nounset-safe, populated context blocks, readable <pre>)"
     echo "Generated: $(date)"
     echo "Host (FQDN): ${HOST_FQDN}"
+    echo "OS: $(get_os_pretty)"
+    echo "Kernel: $(get_kernel)"
+    echo "CPU: $(get_cpu_info)"
+    echo "RAM: $(get_ram_info)"
+    echo "Uptime: $(get_uptime_pretty)"
     echo "Profile: $PROFILE_NAME"
     echo "Scan paths: ${SCAN_PATHS[*]}"
     echo "Excluded paths: ${EXCLUDE_PATHS[*]}"
@@ -461,11 +853,49 @@ write_report_txt() {
     echo "Context mode: $CONTEXT_MODE"
     echo "Redaction: TXT=$REDACT | HTML=$HTML_REDACT"
     echo "File metadata: $INCLUDE_FILE_METADATA"
+    echo ".kredkiignore: $IGNORE_ENABLED ${IGNORE_FILE:+($IGNORE_FILE)}"
+    if [[ "$IGNORE_ENABLED" == "true" && ${#IGNORE_PATTERNS[@]} -gt 0 ]]; then
+      echo "Ignore patterns: $(IFS=,; echo ${IGNORE_PATTERNS[*]})"
+    fi
+    echo
+    echo "Disk / partitions (df -hT)"
+    echo "--------------------------"
+    get_partitions
+    echo
+    echo "Network (ip -br a)"
+    echo "---------------"
+    get_ip_brief
+    echo
+    echo "Users (context)"
+    echo "--------------"
+    get_users_summary
+    echo
+    echo "Sudoers (context)"
+    echo "----------------"
+    get_sudo_summary
     echo
     echo "Summary"
     echo "------"
     echo "Total scan time: $(format_duration "$total_s")"
     echo "Total findings: $total_hits"
+    if [[ "$ENABLE_INTEL" == "true" && "$total_hits" -gt 0 ]]; then
+      echo
+      echo "Top 10 risky files"
+      echo "------------------"
+      while IFS=$'\t' read -r s f; do
+        label="$(risk_label "$s")"
+        tags="${FILE_TAGS[$f]:-MATCH}"
+        conf="${FILE_CONF[$f]:-LOW}"
+        ctx="${FILE_CTX[$f]:-$(ctx_for_path "$f")}"
+        printf "%3s/100  %-8s  %-6s  conf=%-6s  tags=%s\n      %s\n" "$s" "$label" "$ctx" "$conf" "$tags" "$f"
+      done < <(top_risk_list 10) || true
+      echo
+      echo "Top 10 largest files with findings"
+      echo "----------------------------------"
+      while IFS=$'\t' read -r sz f; do
+        printf "%8s  hits=%-4s  %s\n" "$(human_bytes "$sz")" "${FILE_HITS[$f]:-0}" "$f"
+      done < <(top_largest_files_with_findings 10) || true
+    fi
     echo
     echo "Directories (time / hits)"
     echo "------------------------"
@@ -490,18 +920,34 @@ write_report_txt() {
 
     if (( total_hits > 0 )); then
       echo
-      echo "Files (unique) + access/ownership"
-      echo "--------------------------------"
+      echo "Files (unique) + access/ownership + risk"
+      echo "-----------------------------------------"
       if [[ "$INCLUDE_FILE_METADATA" == "true" ]]; then
         for f in "${!UNIQUE_FILES[@]}"; do
+          local ctx risk label tags conf flags
+          ctx="${FILE_CTX[$f]:-$(ctx_for_path "$f")}"
+          risk="${FILE_RISK[$f]:-0}"
+          label="$(risk_label "$risk")"
+          tags="${FILE_TAGS[$f]:-MATCH}"
+          conf="${FILE_CONF[$f]:-LOW}"
+          flags="${FILE_FLAGS[$f]:-unknown}"
           echo "$f"
-          echo "  $(file_meta "$f")"
+          echo "  context: ${ctx} | tags: ${tags} | confidence: ${conf}"
+          echo "  risk: ${risk}/100 (${label})"
+          echo "  access: $(file_meta "$f")"
+          echo "  perm_flags: ${flags}"
           echo "  hits: ${FILE_HITS["$f"]:-0}"
           echo
         done
       else
         for f in "${!UNIQUE_FILES[@]}"; do
-          echo "$f (hits: ${FILE_HITS["$f"]:-0})"
+          local ctx risk label tags conf
+          ctx="${FILE_CTX[$f]:-$(ctx_for_path "$f")}"
+          risk="${FILE_RISK[$f]:-0}"
+          label="$(risk_label "$risk")"
+          tags="${FILE_TAGS[$f]:-MATCH}"
+          conf="${FILE_CONF[$f]:-LOW}"
+          echo "$f (hits: ${FILE_HITS["$f"]:-0}) | ctx=${ctx} | risk=${risk}/100(${label}) | tags=${tags} | conf=${conf}"
         done
       fi
 
@@ -512,10 +958,32 @@ write_report_txt() {
         while IFS= read -r l; do
           [[ -z "$l" ]] && continue
           [[ "$l" == \[* ]] && continue
-          redact_line "$l"
-        done < "$raw_file"
+          if [[ "$ENABLE_INTEL" == "true" ]]; then
+            local cls tag_str conf sev
+            cls="$(classify_content "$l")"
+            tag_str="${cls%%|*}"
+            conf="${cls#*|}"; conf="${conf%%|*}"
+            sev="${cls##*|}"
+            printf "[TAGS:%s][CONF:%s][SEV:%s] %s\n" "$tag_str" "$conf" "$sev" "$(redact_line "$l")"
+          else
+            redact_line "$l"
+          fi
+        done < "$raw_file" || true
       else
-        cat "$raw_file"
+        if [[ "$ENABLE_INTEL" == "true" ]]; then
+          while IFS= read -r l; do
+            [[ -z "$l" ]] && continue
+            [[ "$l" == \[* ]] && continue
+            local cls tag_str conf sev
+            cls="$(classify_content "$l")"
+            tag_str="${cls%%|*}"
+            conf="${cls#*|}"; conf="${conf%%|*}"
+            sev="${cls##*|}"
+            printf "[TAGS:%s][CONF:%s][SEV:%s] %s\n" "$tag_str" "$conf" "$sev" "$l"
+          done < "$raw_file" || true
+        else
+          cat "$raw_file"
+        fi
       fi
     else
       echo
@@ -533,20 +1001,53 @@ html_meta_rows() {
   [[ "$INCLUDE_FILE_METADATA" == "true" ]] || return 0
   local count=0 max_show=400
   for f in "${!UNIQUE_FILES[@]}"; do
-    ((count++)); [[ $count -gt $max_show ]] && break
-    local meta; meta="$(file_meta "$f")"
-    printf '<tr><td><code>%s</code></td><td><code>%s</code></td><td>%s</td></tr>\n' \
+    ((++count)); [[ $count -gt $max_show ]] && break
+    local meta ctx risk tags conf flags label
+    meta="$(file_meta "$f")"
+    ctx="${FILE_CTX[$f]:-$(ctx_for_path "$f")}"
+    risk="${FILE_RISK[$f]:-0}"
+    label="$(risk_label "$risk")"
+    tags="${FILE_TAGS[$f]:-MATCH}"
+    conf="${FILE_CONF[$f]:-LOW}"
+    flags="${FILE_FLAGS[$f]:-unknown}"
+
+    printf '<tr><td><code>%s</code></td><td><code>%s</code></td><td><code>%s</code></td><td><code>%s</code></td><td>%s</td><td><code>%s</code></td></tr>\n' \
       "$(printf '%s' "$f" | html_escape)" \
       "$(printf '%s' "$meta" | html_escape)" \
-      "${FILE_HITS["$f"]:-0}"
+      "$(printf '%s' "$ctx" | html_escape)" \
+      "$(printf '%s' "risk=${risk}/100(${label}) | tags=${tags} | conf=${conf}" | html_escape)" \
+      "${FILE_HITS["$f"]:-0}" \
+      "$(printf '%s' "$flags" | html_escape)"
   done
 }
 
-generate_html_report() {
-  local raw_file="$1" total_s="$2" html_out="$3"
-  local total_hits; total_hits="$(total_hits_from_file "$raw_file")"
 
-  local dir_rows=""
+generate_html_report() {
+  # ---- HTML generation must not abort on unset variables (set -u / nounset) ----
+  local __kredki_nounset_was_on=0
+  case "$-" in
+    *u*) __kredki_nounset_was_on=1; set +u ;;
+  esac
+  # Restore nounset on function return
+  trap '(( __kredki_nounset_was_on )) && set -u' RETURN
+
+  local raw_file="$1" total_s="$2" html_out="$3"
+local total_hits; total_hits="$(total_hits_from_file "$raw_file")"
+
+# Precompute system/context blocks for HTML (these are shown in the dashboard).
+# Important: do NOT allow failures here to abort report generation.
+local os_pretty="" kernel="" cpu="" ram="" uptime="" ip="" users="" sudo_summary="" partitions=""
+os_pretty="$(get_os_pretty 2>/dev/null | html_escape || true)"
+kernel="$(get_kernel 2>/dev/null | html_escape || true)"
+cpu="$(get_cpu_info 2>/dev/null | html_escape || true)"
+ram="$(get_ram_info 2>/dev/null | html_escape || true)"
+uptime="$(get_uptime_pretty 2>/dev/null | html_escape || true)"
+ip="$(get_ip_brief 2>/dev/null | html_escape || true)"
+users="$(get_users_summary 2>/dev/null | html_escape || true)"
+sudo_summary="$(get_sudo_summary 2>/dev/null | html_escape || true)"
+partitions="$(get_partitions 2>/dev/null | html_escape || true)"
+
+local dir_rows=""
   if (( ${#DIR_NAMES[@]} > 0 )); then
     for i in "${!DIR_NAMES[@]}"; do
       dir_rows+=$'<tr><td><code>'"$(printf '%s' "${DIR_NAMES[$i]}" | html_escape)"$'</code></td><td>'"$(format_duration "${DIR_SECONDS[$i]}")"$'</td><td>'"${DIR_HITS[$i]}"$'</td></tr>\n'
@@ -560,17 +1061,40 @@ generate_html_report() {
 
   local findings_raw
   if [[ "$HTML_REDACT" == "true" ]]; then
-    findings_raw="$(while IFS= read -r l; do [[ -z "$l" ]] && continue; [[ "$l" == \[* ]] && continue; redact_line "$l"; done < "$raw_file" | html_escape || true)"
+    findings_raw="$(while IFS= read -r l; do [[ -z "$l" ]] && continue; [[ "$l" == \[* ]] && continue; if [[ "$ENABLE_INTEL" == "true" ]]; then cls="$(classify_content "$l")"; tag_str="${cls%%|*}"; conf="${cls#*|}"; conf="${conf%%|*}"; sev="${cls##*|}"; printf "[TAGS:%s][CONF:%s][SEV:%s] %s\n" "$tag_str" "$conf" "$sev" "$(redact_line "$l")"; else redact_line "$l"; fi; done < "$raw_file" | html_escape || true)"
   else
-    findings_raw="$(cat "$raw_file" | html_escape || true)"
+    findings_raw="$(if [[ "$ENABLE_INTEL" == "true" ]]; then while IFS= read -r l; do [[ -z "$l" ]] && continue; [[ "$l" == \[* ]] && continue; cls="$(classify_content "$l")"; tag_str="${cls%%|*}"; conf="${cls#*|}"; conf="${conf%%|*}"; sev="${cls##*|}"; printf "[TAGS:%s][CONF:%s][SEV:%s] %s\n" "$tag_str" "$conf" "$sev" "$l"; done < "$raw_file" | html_escape; else cat "$raw_file" | html_escape; fi || true)"
   fi
 
   local rules_html; rules_html="$(print_context_rules | html_escape | sed 's/$/<br>/' )"
+
+  # Top 10 risky files rows
+  local top_rows=""
+  # Top 10 largest files with findings rows
+  local largest_rows=""
+  if [[ $total_hits -gt 0 ]]; then
+    while IFS=$'\t' read -r sz f; do
+      largest_rows+="<tr><td><code>$(human_bytes $sz)</code></td><td>${FILE_HITS[$f]:-0}</td><td><code>$(printf '%s' \"$f\" | html_escape)</code></td></tr>\\n"
+    done < <(top_largest_files_with_findings 10) || true
+  fi
+
+  if [[ "$ENABLE_INTEL" == "true" && $total_hits -gt 0 ]]; then
+    while IFS=$'\t' read -r s f; do
+      label="$(risk_label "$s")"
+      ctx="${FILE_CTX[$f]:-$(ctx_for_path "$f")}"
+      conf="${FILE_CONF[$f]:-LOW}"
+      tags="${FILE_TAGS[$f]:-MATCH}"
+      top_rows+="<tr data-risk=\"$s\"><td><b>$s/100</b></td><td><code>$label</code></td><td><code>$ctx</code></td><td><code>$conf</code></td><td><code>$(printf '%s' \"$tags\" | html_escape)</code></td><td><code>$(printf '%s' \"$f\" | html_escape)</code></td></tr>\\n"
+    done < <(top_risk_list 10) || true
+  fi
+
   local meta_rows=""
   if [[ "$INCLUDE_FILE_METADATA" == "true" && $total_hits -gt 0 ]]; then
     meta_rows="$(html_meta_rows)"
   fi
 
+  mkdir -p "$(dirname "$html_out")" 2>/dev/null || true
+  : > "$html_out" 2>/dev/null || true
   cat > "$html_out" <<EOF
 <!doctype html>
 <html lang="en"><head>
@@ -587,7 +1111,8 @@ body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto S
 .pill{display:flex;gap:8px;align-items:center;padding:10px 12px;border-radius:999px;border:1px solid #e6e6e6;background:#fafafa}
 table{border-collapse:collapse;width:100%} th,td{border-bottom:1px solid #eee;text-align:left;padding:10px;vertical-align:top} th{background:#fafafa}
 code{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace}
-pre{background:#0b0f14;color:#e6edf3;border-radius:14px;padding:14px;overflow:auto;white-space:pre-wrap;word-break:break-word}
+pre{background:#0b0f14 !important;color:#e6edf3 !important;border-radius:14px;padding:14px;overflow:auto;white-space:pre-wrap;word-break:break-word}
+pre, pre code, pre span{color:#e6edf3 !important;}
 .high{color:#b00020;font-weight:800}.med{color:#b26a00;font-weight:800}.low{color:#0b6e4f;font-weight:800}
 .btns{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px} button{border:1px solid #ddd;background:#fff;border-radius:10px;padding:8px 10px;cursor:pointer}
 button:hover{background:#f7f7f7}
@@ -597,6 +1122,7 @@ ul{margin:10px 0 0 18px}
 </style></head><body><div class="wrap">
 <h1>🎨 KREDKI Report</h1>
 <div class="muted">Generated: $(date) • Host: ${HOST_FQDN} • Version: ${VERSION} • Profile: ${PROFILE_NAME}</div>
+  <div class="muted">Release notes: <b>v1.8</b> – HTML generation fixed (nounset-safe, populated context blocks, readable &lt;pre&gt;)</div>
 
 <div class="card">
   <div class="grid">
@@ -610,15 +1136,56 @@ ul{margin:10px 0 0 18px}
     <button onclick="filterCtx('HIGH')">HIGH only</button>
     <button onclick="filterCtx('MEDIUM')">MEDIUM only</button>
     <button onclick="filterCtx('LOW')">LOW only</button>
+    <button onclick="sortMetadataByRisk()">Sort metadata by risk</button>
   </div>
   <div class="muted" style="margin-top:10px">
+    System: <b>${os_pretty}</b> • Kernel: <b>${kernel}</b><br>
+    CPU: <b>${cpu}</b> • RAM: <b>${ram}</b><br>
     Context mode: <b>${CONTEXT_MODE}</b> • HTML redaction: <b>${HTML_REDACT}</b> • File metadata: <b>${INCLUDE_FILE_METADATA}</b>
   </div>
 </div>
 
+<div class="card"><h2>🏆 Top 10 risky files</h2>
+<div class="muted">Ranked by risk score (context + severity + permissions). Redaction does not affect ranking.</div>
+<table id="topRiskTable"><thead><tr><th>Risk</th><th>Label</th><th>Context</th><th>Confidence</th><th>Tags</th><th>File</th></tr></thead><tbody>
+${top_rows:-<tr><td colspan="7" class="muted">No findings.</td></tr>}
+</tbody></table>
+</div>
+
+</div>
+
+<div class="card"><h2>🗄️ Disk / partitions</h2>
+<div class="muted">Output of <code>df -hT</code> (tmpfs/devtmpfs excluded).</div>
+<pre>${partitions}</pre>
+</div>
+
+<div class="card"><h2>⏳ Uptime</h2>
+<pre>${uptime}</pre>
+</div>
+
+<div class="card"><h2>🌐 Network snapshot</h2>
+<div class="muted">Output of <code>ip -br a</code>.</div>
+<pre>${ip}</pre>
+</div>
+
+<div class="card"><h2>👥 Users (context)</h2>
+<pre>${users}</pre>
+</div>
+
+<div class="card"><h2>🛂 Sudoers (context)</h2>
+<pre>${sudo_summary}</pre>
+</div>
+
+<div class="card"><h2>📦 Top 10 largest files with findings</h2>
+<div class="muted">Useful for triage. Sizes are current file sizes.</div>
+<table><thead><tr><th>Size</th><th>Hits</th><th>File</th></tr></thead><tbody>
+${largest_rows:-<tr><td colspan="3" class="muted">No findings.</td></tr>}
+</tbody></table>
+</div>
+
 <div class="card"><h2>📂 Directories (time / hits)</h2>
 <table><thead><tr><th>Directory</th><th>Time</th><th>Hits</th></tr></thead><tbody>
-${dir_rows:-<tr><td colspan="3" class="muted">No directory stats available.</td></tr>}
+${dir_rows:-<tr><td colspan="7" class="muted">No directory stats available.</td></tr>}
 </tbody></table></div>
 
 <div class="card"><h2>🧭 Security Context</h2>
@@ -636,8 +1203,8 @@ ${dir_rows:-<tr><td colspan="3" class="muted">No directory stats available.</td>
 
 <div class="card"><h2>🔐 File Access & Ownership</h2>
 <div class="muted">Shows current permissions and ownership for files that produced findings. The chmod/chown commands reproduce current state.</div>
-<table><thead><tr><th>File</th><th>Metadata (chmod / chown)</th><th>Hits</th></tr></thead><tbody>
-${meta_rows:-<tr><td colspan="3" class="muted">File metadata disabled or no findings.</td></tr>}
+<table id="metaTable"><thead><tr><th>Risk</th><th>File</th><th>Metadata (chmod / chown)</th><th>Context</th><th>Intel & Risk</th><th>Hits</th><th>Perm flags</th></tr></thead><tbody id="metaTbody">
+${meta_rows:-<tr><td colspan="7" class="muted">File metadata disabled or no findings.</td></tr>}
 </tbody></table></div>
 
 <div class="card"><h2>🔎 Findings (raw matches)</h2>
@@ -647,6 +1214,14 @@ ${meta_rows:-<tr><td colspan="3" class="muted">File metadata disabled or no find
 <div class="muted warn">⚠️ This report may contain sensitive data. Share carefully.</div>
 </div>
 <script>
+function sortMetadataByRisk(){
+  const tbody = document.getElementById("metaTbody");
+  if(!tbody) return;
+  const rows = Array.from(tbody.querySelectorAll("tr"));
+  rows.sort((a,b)=> (parseInt(b.dataset.risk||"0",10) - parseInt(a.dataset.risk||"0",10)) );
+  rows.forEach(r=>tbody.appendChild(r));
+}
+
 function filterCtx(level){
   const nodes = document.querySelectorAll('.ctx');
   nodes.forEach(n=>{
@@ -683,10 +1258,13 @@ while [[ $# -gt 0 ]]; do
     --context-mode) [[ $# -ge 2 ]] || die "--context-mode requires: line|file"; OVERRIDE_CONTEXT_MODE="$2"; shift 2 ;;
     --redact) OVERRIDE_REDACT="true"; shift ;;
     --no-redact) OVERRIDE_NO_REDACT=true; shift ;;
-    --html) OVERRIDE_GENERATE_HTML=true; shift ;;
-    --html-file) [[ $# -ge 2 ]] || die "--html-file requires a value"; OVERRIDE_HTML_FILE="$2"; shift 2 ;;
+    --html) OVERRIDE_GENERATE_HTML=true; GENERATE_HTML=true; shift ;;
+    --html-file) [[ $# -ge 2 ]] || die "--html-file requires a value"; OVERRIDE_HTML_FILE="$2"; GENERATE_HTML=true; shift 2 ;;
     --file-metadata) INCLUDE_FILE_METADATA=true; shift ;;
     --no-file-metadata) INCLUDE_FILE_METADATA=false; shift ;;
+    --ignore-file) [[ $# -ge 2 ]] || die "--ignore-file requires a path"; IGNORE_FILE="$2"; shift 2 ;;
+    --no-ignore) IGNORE_ENABLED=false; shift ;;
+    --show-ignored) SHOW_IGNORED=true; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "Unknown option: $1 (use --help)" ;;
   esac
@@ -720,6 +1298,7 @@ fi
 [[ "$REDACT" == "true" ]] && HTML_REDACT=true
 
 apply_safe_mode
+load_kredkiignore
 
 mapfile -t EXISTING_DIRS < <(get_existing_scan_paths)
 print_config
@@ -767,11 +1346,35 @@ echo -e "📁 Raw matches: ${CYAN}${RAW_FILE}${NC}"
 echo -e "⏱️  Total time : ${YELLOW}$(format_duration "$TOTAL_S")${NC}"
 echo -e "🔐 Findings   : ${YELLOW}$(total_hits_from_file "$RAW_FILE")${NC}"
 
+# Quick risk distribution
+if [[ "$ENABLE_INTEL" == "true" ]]; then
+  crit=0; high=0; med=0; low=0
+  for f in "${!UNIQUE_FILES[@]}"; do
+    score="${FILE_RISK[$f]:-0}"
+    label="$(risk_label "$score")"
+    case "$label" in
+      CRITICAL) ((++crit)) ;;
+      HIGH) ((++high)) ;;
+      MEDIUM) ((++med)) ;;
+      LOW) ((++low)) ;;
+    esac
+  done
+  echo -e "🚦 Risk files : ${RED}CRIT ${crit}${NC} | ${YELLOW}HIGH ${high}${NC} | MED ${med} | LOW ${low}"
+fi
+
+
 # Optional HTML
 if [[ "$GENERATE_HTML" == "true" ]]; then
   [[ -z "$HTML_FILE" ]] && HTML_FILE="${REPORT_FILE%.txt}.html"
-  generate_html_report "$RAW_FILE" "$TOTAL_S" "$HTML_FILE"
-  echo -e "📄 HTML       : ${CYAN}${HTML_FILE}${NC}"
+  if generate_html_report "$RAW_FILE" "$TOTAL_S" "$HTML_FILE"; then
+    if [[ -s "$HTML_FILE" ]]; then
+      echo -e "📄 HTML       : ${CYAN}${HTML_FILE}${NC}"
+    else
+      echo -e "${YELLOW}[!]${NC} HTML generator ran but file is empty: ${CYAN}${HTML_FILE}${NC}"
+    fi
+  else
+    echo -e "${YELLOW}[!]${NC} HTML generation failed. Check stderr output above."
+  fi
 fi
 
 echo
