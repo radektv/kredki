@@ -28,7 +28,12 @@ NC='\033[0m'
 SPINNER='|/-\'
 # ===============================================
 
-VERSION="1.4.1-pro-html-meta-exclude-self"
+VERSION="1.4.2-pro-html-meta-exclude-self-fqdn"
+# Host identification (FQDN preferred)
+HOST_FQDN="$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo unknown-host)"
+# Make it filename-safe
+HOST_FQDN_SAFE="$(printf \'%s\' "$HOST_FQDN" | tr \'/ \' \'__\' | tr -cd \'A-Za-z0-9._-\' )"
+
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PATTERN_FILE="$SCRIPT_DIR/patterns.txt"
@@ -448,6 +453,7 @@ write_report_txt() {
     echo "KREDKI Report"
     echo "Version: $VERSION"
     echo "Generated: $(date)"
+    echo "Host (FQDN): ${HOST_FQDN}"
     echo "Profile: $PROFILE_NAME"
     echo "Scan paths: ${SCAN_PATHS[*]}"
     echo "Excluded paths: ${EXCLUDE_PATHS[*]}"
@@ -590,7 +596,7 @@ ul{margin:10px 0 0 18px}
 .warn{color:#7a4b00}
 </style></head><body><div class="wrap">
 <h1>🎨 KREDKI Report</h1>
-<div class="muted">Generated: $(date) • Version: ${VERSION} • Profile: ${PROFILE_NAME}</div>
+<div class="muted">Generated: $(date) • Host: ${HOST_FQDN} • Version: ${VERSION} • Profile: ${PROFILE_NAME}</div>
 
 <div class="card">
   <div class="grid">
@@ -735,8 +741,8 @@ if [[ "$NON_INTERACTIVE" != "true" ]]; then
 fi
 
 TS="$(date +%F_%H-%M-%S)"
-RAW_FILE="$SCRIPT_DIR/kredki_found_${TS}.raw.txt"
-REPORT_FILE="$SCRIPT_DIR/kredki_found_${TS}.txt"
+RAW_FILE="$SCRIPT_DIR/kredki_found_${HOST_FQDN_SAFE}_${TS}.raw.txt"
+REPORT_FILE="$SCRIPT_DIR/kredki_found_${HOST_FQDN_SAFE}_${TS}.txt"
 
 echo
 : > "$RAW_FILE"
@@ -755,6 +761,7 @@ echo -e "${GREEN}[✔] Scan completed successfully!${NC}"
 echo
 echo -e "${BOLD}📊 Scan Summary${NC}"
 echo -e "────────────────────────────────────────"
+echo -e "🖥️  Host (FQDN): ${CYAN}${HOST_FQDN}${NC}"
 echo -e "📁 Report TXT : ${CYAN}${REPORT_FILE}${NC}"
 echo -e "📁 Raw matches: ${CYAN}${RAW_FILE}${NC}"
 echo -e "⏱️  Total time : ${YELLOW}$(format_duration "$TOTAL_S")${NC}"
