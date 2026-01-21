@@ -28,11 +28,11 @@ NC='\033[0m'
 SPINNER='|/-\'
 # ===============================================
 
-VERSION="1.4.2-pro-html-meta-exclude-self-fqdn"
+VERSION="1.4.4-pro-html-meta-exclude-self-fqdn"
 # Host identification (FQDN preferred)
 HOST_FQDN="$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo unknown-host)"
 # Make it filename-safe
-HOST_FQDN_SAFE="$(printf \'%s\' "$HOST_FQDN" | tr \'/ \' \'__\' | tr -cd \'A-Za-z0-9._-\' )"
+HOST_FQDN_SAFE="$(printf '%s' "$HOST_FQDN" | sed 's/[^A-Za-z0-9._-]/_/g')"
 
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
