@@ -3,15 +3,16 @@
 #  K R E D K I  – Fast Secret Scanner for Linux
 #  UI Wrapper (PRO+HTML+REPORT)
 #
-#  v1.4-pro-html-meta-exclude-self
+#  v1.4.1-pro-html-meta-exclude-self
+#   FIXES:
+#    - Proper ripgrep argument handling (no broken quoting) ✅
+#    - Clean, readable TXT report (separate from raw log) ✅
+#
+#  FEATURES:
 #   - File metadata (chmod/chown style) in TXT + HTML (optional)
 #   - Auto-exclude the KREDKI project directory from scans
 #   - Auto-exclude kredki_found_*.txt/html and *.redacted.txt from scans
-#
-#  Usage:
-#    ./kredki-ui.sh --paths /var --non-interactive --html
-#    ./kredki-ui.sh --profile prod --safe --html --context-mode file
-#    ./kredki-ui.sh --html --redact
+#   - Profiles, safe mode, context mode, HTML, redaction
 # ============================================================
 
 set -euo pipefail
@@ -27,7 +28,7 @@ NC='\033[0m'
 SPINNER='|/-\'
 # ===============================================
 
-VERSION="1.4-pro-html-meta-exclude-self"
+VERSION="1.4.1-pro-html-meta-exclude-self"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PATTERN_FILE="$SCRIPT_DIR/patterns.txt"
@@ -55,7 +56,7 @@ CONTEXT_MODE="line"        # line | file
 REDACT=false               # for TXT output (optional)
 REDACT_HTML_DEFAULT=true   # HTML is redacted by default
 
-# NEW: permissions / ownership metadata
+# Permissions / ownership metadata
 INCLUDE_FILE_METADATA=true
 
 # Exclusions (base)
@@ -93,12 +94,12 @@ Options:
   --html-file <path>        Custom HTML report path
 
   --file-metadata           Include chmod/chown-style metadata in TXT+HTML (default)
-  --no-file-metadata        Disable file metadata sections (faster / quieter)
+  --no-file-metadata        Disable file metadata sections
 
   -h, --help                Show this help
 
 Examples:
-  ./kredki-ui.sh --paths /var --non-interactive --html
+  ./kredki-ui.sh --paths /etc,/home --html
   ./kredki-ui.sh --profile prod --safe --html --context-mode file
   ./kredki-ui.sh --html --redact --context-mode file
 EOF
@@ -274,14 +275,12 @@ file_meta() {
   printf '%s' "${META_CACHE[$f]}"
 }
 
-# Build ripgrep args for a scan root, excluding:
-# - output files (kredki_found_*)
-# - project dir if inside root (exact)
+# Build ripgrep args array for a scan root (FIXED: no broken quoting)
+RG_ARGS=()
 rg_args_for_root() {
   local root="$1"
   local cpu="$2"
-
-  local -a args=(
+  RG_ARGS=(
     -i --threads "$cpu" --no-heading --line-number
     --max-filesize "$MAX_FILE_SIZE"
     -f "$PATTERN_FILE"
@@ -290,249 +289,256 @@ rg_args_for_root() {
     --glob '!*\.redacted\.txt'
   )
 
-  [[ "$FOLLOW_SYMLINKS" == "true" ]] && args+=(--follow) || args+=(--no-follow)
-  args+=("${EXCLUDE_GLOBS[@]}")
+  [[ "$FOLLOW_SYMLINKS" == "true" ]] && RG_ARGS+=(--follow) || RG_ARGS+=(--no-follow)
+  RG_ARGS+=("${EXCLUDE_GLOBS[@]}")
 
   if [[ "$AUTO_EXCLUDE_PROJECT_DIR" == "true" ]]; then
     case "$PROJECT_DIR" in
       "$root"|"$root"/*)
         local rel="${PROJECT_DIR#"$root"/}"
         if [[ "$rel" != "$PROJECT_DIR" && -n "$rel" ]]; then
-          args+=(--glob "!${rel}/**")
+          RG_ARGS+=(--glob "!${rel}/**")
         elif [[ "$PROJECT_DIR" == "$root" ]]; then
-          args+=(--glob "!**")
+          RG_ARGS+=(--glob "!**")
         fi
         ;;
     esac
   fi
-
-  printf '%q ' "${args[@]}"
 }
 
-run_scan() {
-  local out_file="$1"; shift
+# RAW scan -> only matches (no debug markers) for clean parsing
+run_scan_raw() {
+  local raw_file="$1"; shift
   local -a dirs=("$@")
   local cpu; cpu="$(nproc)"
 
-  : > "$out_file"
-  chmod 600 "$out_file"
-
-  {
-    echo "[*] Start scan: $(date)"
-    echo "[*] CPU: $cpu | rg threads: $cpu"
-    echo "[*] Profile: $PROFILE_NAME"
-    echo "[*] Safe mode: $SAFE_MODE"
-    echo "[*] Max file size: $MAX_FILE_SIZE"
-    echo "[*] Follow symlinks: $FOLLOW_SYMLINKS"
-    echo "[*] Context mode: $CONTEXT_MODE"
-    echo "[*] File metadata: $INCLUDE_FILE_METADATA"
-    echo "[*] Auto-exclude project dir: $AUTO_EXCLUDE_PROJECT_DIR ($PROJECT_DIR)"
-    echo
-  } >> "$out_file"
+  : > "$raw_file"
+  chmod 600 "$raw_file"
 
   local total_start total_end total_s
   total_start=$(date +%s)
 
   local d
   for d in "${dirs[@]}"; do
-    local start end dur hits
-    start=$(date +%s)
-
     local ex skip=false
     for ex in "${EXCLUDE_PATHS[@]}"; do
       if [[ "$d" == "$ex" || "$d" == "$ex/"* ]]; then skip=true; break; fi
     done
     [[ "$skip" == "true" ]] && continue
 
-    local tmp; tmp="$(mktemp)"
-
-    { echo "[*] --- Scanning: $d ---"; echo "[*] Start: $(date)"; } >> "$out_file"
-
-    local rg_args_str
-    rg_args_str="$(rg_args_for_root "$d" "$cpu")"
-    # shellcheck disable=SC2086
-    if rg ${rg_args_str} "$d" > "$tmp"; then :; else
+    rg_args_for_root "$d" "$cpu"
+    # shellcheck disable=SC2317
+    if rg "${RG_ARGS[@]}" "$d" >> "$raw_file"; then
+      :
+    else
       rc=$?
-      [[ $rc -ne 1 ]] && echo "[!] rg error (exit $rc) while scanning $d" >> "$out_file"
+      # rg exit 1 = no matches; anything else is an error
+      [[ $rc -ne 1 ]] && printf '[!] rg error (exit %s) while scanning %s\n' "$rc" "$d" >> "$raw_file"
     fi
-
-    cat "$tmp" >> "$out_file"
-
-    end=$(date +%s)
-    dur=$((end - start))
-    hits=$(wc -l < "$tmp" | tr -d ' ')
-
-    { echo; echo "[*] End: $(date)"; echo "[*] Duration: ${dur}s"; echo "[*] Hits: $hits"; echo; } >> "$out_file"
-    rm -f "$tmp"
   done
 
   total_end=$(date +%s)
   total_s=$((total_end - total_start))
-  { echo "[+] Finished: $(date)"; echo "[+] Total duration: ${total_s}s"; echo "[+] Results saved in: $out_file"; } >> "$out_file"
+  echo "$total_s"
 }
 
-# -------- Stats parsing --------
+# -------- Stats / report building --------
 DIR_NAMES=(); DIR_SECONDS=(); DIR_HITS=()
 CTX_HIGH=0; CTX_MEDIUM=0; CTX_LOW=0
 BREAK_HIGH=(); BREAK_MEDIUM=(); BREAK_LOW=()
 declare -A SEEN_HIGH=(); declare -A SEEN_MEDIUM=(); declare -A SEEN_LOW=()
 declare -A UNIQUE_FILES=()
+declare -A FILE_HITS=()
 
-parse_stats_from_output() {
-  local out_file="$1"
-
-  DIR_NAMES=(); DIR_SECONDS=(); DIR_HITS=()
-  CTX_HIGH=0; CTX_MEDIUM=0; CTX_LOW=0
-  BREAK_HIGH=(); BREAK_MEDIUM=(); BREAK_LOW=()
-  SEEN_HIGH=(); SEEN_MEDIUM=(); SEEN_LOW=()
-  UNIQUE_FILES=()
-
-  while IFS= read -r line; do
-    case "$line" in
-      "[*] --- Scanning:"*) d="${line#'[*] --- Scanning: '}"; d="${d%' ---'}"; DIR_NAMES+=("$d") ;;
-      "[*] Duration:"*) s="${line#'[*] Duration: '}"; s="${s%s}"; DIR_SECONDS+=("$s") ;;
-      "[*] Hits:"*) h="${line#'[*] Hits: '}"; DIR_HITS+=("$h") ;;
-    esac
-  done < "$out_file"
-
-  while IFS= read -r m; do
-    [[ -z "$m" ]] && continue
-    file="${m%%:*}"
-    UNIQUE_FILES["$file"]=1
-
-    [[ "$ENABLE_SECURITY_CONTEXT" == "true" ]] || continue
-    ctx="$(ctx_for_path "$file")"
-
-    if [[ "$CONTEXT_MODE" == "file" ]]; then
-      case "$ctx" in
-        HIGH)
-          if [[ -z "${SEEN_HIGH[$file]+x}" ]]; then
-            SEEN_HIGH["$file"]=1; BREAK_HIGH+=("$file"); [[ "$ENABLE_HIGH_RISK" == "true" ]] && ((++CTX_HIGH))
-          fi ;;
-        MEDIUM)
-          if [[ -z "${SEEN_MEDIUM[$file]+x}" ]]; then
-            SEEN_MEDIUM["$file"]=1; BREAK_MEDIUM+=("$file"); [[ "$ENABLE_MEDIUM_RISK" == "true" ]] && ((++CTX_MEDIUM))
-          fi ;;
-        LOW)
-          if [[ -z "${SEEN_LOW[$file]+x}" ]]; then
-            SEEN_LOW["$file"]=1; BREAK_LOW+=("$file"); [[ "$ENABLE_LOW_RISK" == "true" ]] && ((++CTX_LOW))
-          fi ;;
-      esac
-    else
-      case "$ctx" in
-        HIGH) BREAK_HIGH+=("$m"); [[ "$ENABLE_HIGH_RISK" == "true" ]] && ((++CTX_HIGH)) ;;
-        MEDIUM) BREAK_MEDIUM+=("$m"); [[ "$ENABLE_MEDIUM_RISK" == "true" ]] && ((++CTX_MEDIUM)) ;;
-        LOW) BREAK_LOW+=("$m"); [[ "$ENABLE_LOW_RISK" == "true" ]] && ((++CTX_LOW)) ;;
-      esac
-    fi
-  done < <(grep -v '^\[' "$out_file" 2>/dev/null || true)
-}
-
-total_hits_from_file() { grep -v '^\[' "$1" 2>/dev/null | wc -l | tr -d ' '; }
+total_hits_from_file() { wc -l < "$1" | tr -d ' '; }
 
 print_context_rules() {
   cat << 'EOF'
-Rules (inferred from file location; not an exploit signal):
+Zasady (wnioskowanie po ścieżce, nie sygnał exploita):
   HIGH   → /etc, /root, /opt  +  *.env, .git-credentials, .npmrc, .pypirc
-  MEDIUM → default for everything else (e.g., /var, /home, /srv)
+  MEDIUM → domyślnie reszta (np. /var, /home, /srv)
   LOW    → /tmp, /var/tmp, /dev/shm
 EOF
 }
 
-print_file_metadata_txt() {
-  [[ "$INCLUDE_FILE_METADATA" == "true" ]] || return 0
-  echo
-  echo -e "${BOLD}🔐 File Access & Ownership (unique files)${NC}"
-  echo -e "────────────────────────────────────────"
-  local shown=0 max_show=30
-  for f in "${!UNIQUE_FILES[@]}"; do
-    ((shown++)); [[ $shown -gt $max_show ]] && break
-    echo -e "• ${CYAN}${f}${NC}"
-    echo -e "  ${YELLOW}$(file_meta "$f")${NC}"
-  done
-  local total_unique="${#UNIQUE_FILES[@]}"
-  if (( total_unique > max_show )); then
-    echo -e "… ${YELLOW}(${total_unique} unique files total)${NC}"
-  fi
-  echo
-  echo -e "${BLUE}Tip:${NC} chmod/chown shown reproduce current state (not a recommendation)."
+parse_from_raw() {
+  local raw_file="$1"
+
+  CTX_HIGH=0; CTX_MEDIUM=0; CTX_LOW=0
+  BREAK_HIGH=(); BREAK_MEDIUM=(); BREAK_LOW=()
+  SEEN_HIGH=(); SEEN_MEDIUM=(); SEEN_LOW=()
+  UNIQUE_FILES=(); FILE_HITS=()
+
+  while IFS= read -r m; do
+    [[ -z "$m" ]] && continue
+    [[ "$m" == \[* ]] && continue  # skip rg error lines
+    local file="${m%%:*}"
+    UNIQUE_FILES["$file"]=1
+    FILE_HITS["$file"]=$(( ${FILE_HITS["$file"]:-0} + 1 ))
+
+    [[ "$ENABLE_SECURITY_CONTEXT" == "true" ]] || continue
+    local ctx; ctx="$(ctx_for_path "$file")"
+
+    if [[ "$CONTEXT_MODE" == "file" ]]; then
+      case "$ctx" in
+        HIGH)   if [[ -z "${SEEN_HIGH[$file]+x}" ]]; then SEEN_HIGH["$file"]=1; BREAK_HIGH+=("$file"); [[ "$ENABLE_HIGH_RISK" == "true" ]] && ((++CTX_HIGH)); fi ;;
+        MEDIUM) if [[ -z "${SEEN_MEDIUM[$file]+x}" ]]; then SEEN_MEDIUM["$file"]=1; BREAK_MEDIUM+=("$file"); [[ "$ENABLE_MEDIUM_RISK" == "true" ]] && ((++CTX_MEDIUM)); fi ;;
+        LOW)    if [[ -z "${SEEN_LOW[$file]+x}" ]]; then SEEN_LOW["$file"]=1; BREAK_LOW+=("$file"); [[ "$ENABLE_LOW_RISK" == "true" ]] && ((++CTX_LOW)); fi ;;
+      esac
+    else
+      case "$ctx" in
+        HIGH)   BREAK_HIGH+=("$m"); [[ "$ENABLE_HIGH_RISK" == "true" ]] && ((++CTX_HIGH)) ;;
+        MEDIUM) BREAK_MEDIUM+=("$m"); [[ "$ENABLE_MEDIUM_RISK" == "true" ]] && ((++CTX_MEDIUM)) ;;
+        LOW)    BREAK_LOW+=("$m"); [[ "$ENABLE_LOW_RISK" == "true" ]] && ((++CTX_LOW)) ;;
+      esac
+    fi
+  done < "$raw_file"
 }
 
-summary() {
-  local out_file="$1"
-  local total_s="$2"
-  local total_hits; total_hits="$(total_hits_from_file "$out_file")"
+# Per-directory stats (time + hits)
+scan_dirs_with_stats() {
+  local raw_file="$1"; shift
+  local -a dirs=("$@")
+  local cpu; cpu="$(nproc)"
 
-  echo
-  echo -e "${BOLD}📊 Scan Summary${NC}"
-  echo -e "────────────────────────────────────────"
-  echo -e "🏷️  Profile            : ${CYAN}${PROFILE_NAME}${NC}"
-  echo -e "🏷️  Version            : ${CYAN}${VERSION}${NC}"
-  echo -e "📁 Result file         : ${CYAN}${out_file}${NC}"
-  echo -e "⏱️  Total scan time     : ${YELLOW}$(format_duration "$total_s")${NC}"
-  echo -e "🔐 Total findings       : ${YELLOW}${total_hits}${NC}"
-  echo
+  DIR_NAMES=(); DIR_SECONDS=(); DIR_HITS=()
 
-  echo -e "${BOLD}📂 Directories (time / hits):${NC}"
-  if (( ${#DIR_NAMES[@]} == 0 )); then
-    echo -e "  ${YELLOW}(none)${NC}"
-  else
-    for i in "${!DIR_NAMES[@]}"; do
-      printf "  • %b%s%b  —  %b%s%b  —  %b%s hits%b\n" \
-        "$CYAN" "${DIR_NAMES[$i]}" "$NC" \
-        "$YELLOW" "$(format_duration "${DIR_SECONDS[$i]}")" "$NC" \
-        "$YELLOW" "${DIR_HITS[$i]}" "$NC"
+  local d
+  for d in "${dirs[@]}"; do
+    local ex skip=false
+    for ex in "${EXCLUDE_PATHS[@]}"; do
+      if [[ "$d" == "$ex" || "$d" == "$ex/"* ]]; then skip=true; break; fi
     done
-  fi
+    [[ "$skip" == "true" ]] && continue
 
-  if [[ "$ENABLE_SECURITY_CONTEXT" == "true" ]]; then
-    echo
-    echo -e "${BOLD}🧭 Security Context (mode: ${CONTEXT_MODE})${NC}"
-    [[ "$ENABLE_HIGH_RISK" == "true" ]] && echo -e "  🔴 HIGH   : ${YELLOW}${CTX_HIGH}${NC}"
-    [[ "$ENABLE_MEDIUM_RISK" == "true" ]] && echo -e "  🟠 MEDIUM : ${YELLOW}${CTX_MEDIUM}${NC}"
-    [[ "$ENABLE_LOW_RISK" == "true" ]] && echo -e "  🟡 LOW    : ${YELLOW}${CTX_LOW}${NC}"
-    echo
-    print_context_rules | sed 's/^/  /'
-    echo
-  fi
+    local start end dur hits
+    start=$(date +%s)
+    local tmp; tmp="$(mktemp)"
 
-  if (( total_hits > 0 )); then
-    print_file_metadata_txt
-    echo -e "${RED}⚠️  Action required:${NC} Review findings immediately."
-  else
-    echo -e "${GREEN}✅ No secrets detected.${NC}"
-  fi
+    rg_args_for_root "$d" "$cpu"
+    if rg "${RG_ARGS[@]}" "$d" > "$tmp"; then :; else
+      rc=$?
+      [[ $rc -ne 1 ]] && printf '[!] rg error (exit %s) while scanning %s\n' "$rc" "$d" >> "$raw_file"
+    fi
+
+    cat "$tmp" >> "$raw_file"
+    end=$(date +%s)
+    dur=$((end - start))
+    hits=$(wc -l < "$tmp" | tr -d ' ')
+
+    DIR_NAMES+=("$d")
+    DIR_SECONDS+=("$dur")
+    DIR_HITS+=("$hits")
+
+    rm -f "$tmp"
+  done
 }
 
-# -------- HTML report helpers --------
+write_report_txt() {
+  local raw_file="$1"
+  local report_file="$2"
+  local total_s="$3"
+
+  local total_hits; total_hits="$(total_hits_from_file "$raw_file")"
+
+  : > "$report_file"
+  chmod 600 "$report_file"
+
+  {
+    echo "KREDKI Report"
+    echo "Version: $VERSION"
+    echo "Generated: $(date)"
+    echo "Profile: $PROFILE_NAME"
+    echo "Scan paths: ${SCAN_PATHS[*]}"
+    echo "Excluded paths: ${EXCLUDE_PATHS[*]}"
+    echo "Auto-exclude project dir: $AUTO_EXCLUDE_PROJECT_DIR ($PROJECT_DIR)"
+    echo "Context mode: $CONTEXT_MODE"
+    echo "Redaction: TXT=$REDACT | HTML=$HTML_REDACT"
+    echo "File metadata: $INCLUDE_FILE_METADATA"
+    echo
+    echo "Summary"
+    echo "------"
+    echo "Total scan time: $(format_duration "$total_s")"
+    echo "Total findings: $total_hits"
+    echo
+    echo "Directories (time / hits)"
+    echo "------------------------"
+    if (( ${#DIR_NAMES[@]} == 0 )); then
+      echo "(none)"
+    else
+      for i in "${!DIR_NAMES[@]}"; do
+        printf "%-30s  %8s  %6s hits\n" "${DIR_NAMES[$i]}" "$(format_duration "${DIR_SECONDS[$i]}")" "${DIR_HITS[$i]}"
+      done
+    fi
+
+    if [[ "$ENABLE_SECURITY_CONTEXT" == "true" ]]; then
+      echo
+      echo "Security Context"
+      echo "----------------"
+      printf "HIGH:   %s\n" "$CTX_HIGH"
+      printf "MEDIUM: %s\n" "$CTX_MEDIUM"
+      printf "LOW:    %s\n" "$CTX_LOW"
+      echo
+      print_context_rules
+    fi
+
+    if (( total_hits > 0 )); then
+      echo
+      echo "Files (unique) + access/ownership"
+      echo "--------------------------------"
+      if [[ "$INCLUDE_FILE_METADATA" == "true" ]]; then
+        for f in "${!UNIQUE_FILES[@]}"; do
+          echo "$f"
+          echo "  $(file_meta "$f")"
+          echo "  hits: ${FILE_HITS["$f"]:-0}"
+          echo
+        done
+      else
+        for f in "${!UNIQUE_FILES[@]}"; do
+          echo "$f (hits: ${FILE_HITS["$f"]:-0})"
+        done
+      fi
+
+      echo
+      echo "Findings (raw matches)"
+      echo "---------------------"
+      if [[ "$REDACT" == "true" ]]; then
+        while IFS= read -r l; do
+          [[ -z "$l" ]] && continue
+          [[ "$l" == \[* ]] && continue
+          redact_line "$l"
+        done < "$raw_file"
+      else
+        cat "$raw_file"
+      fi
+    else
+      echo
+      echo "No findings."
+    fi
+  } >> "$report_file"
+}
+
+# -------- HTML helpers --------
 html_escape() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
 
-html_list_items() {
-  while IFS= read -r line; do
-    [[ -z "$line" ]] && continue
-    printf '<li><code>%s</code></li>\n' "$(printf '%s' "$line" | html_escape)"
-  done
-}
+html_list_items() { while IFS= read -r line; do [[ -z "$line" ]] && continue; printf '<li><code>%s</code></li>\n' "$(printf '%s' "$line" | html_escape)"; done; }
 
 html_meta_rows() {
   [[ "$INCLUDE_FILE_METADATA" == "true" ]] || return 0
-  local count=0 max_show=200
+  local count=0 max_show=400
   for f in "${!UNIQUE_FILES[@]}"; do
     ((count++)); [[ $count -gt $max_show ]] && break
     local meta; meta="$(file_meta "$f")"
-    printf '<tr><td><code>%s</code></td><td><code>%s</code></td></tr>\n' \
+    printf '<tr><td><code>%s</code></td><td><code>%s</code></td><td>%s</td></tr>\n' \
       "$(printf '%s' "$f" | html_escape)" \
-      "$(printf '%s' "$meta" | html_escape)"
+      "$(printf '%s' "$meta" | html_escape)" \
+      "${FILE_HITS["$f"]:-0}"
   done
-  local total_unique="${#UNIQUE_FILES[@]}"
-  if (( total_unique > max_show )); then
-    printf '<tr><td colspan="2" class="muted">… (%d unique files total)</td></tr>\n' "$total_unique"
-  fi
 }
 
 generate_html_report() {
-  local out_file="$1" total_s="$2" html_out="$3"
-  local total_hits; total_hits="$(total_hits_from_file "$out_file")"
+  local raw_file="$1" total_s="$2" html_out="$3"
+  local total_hits; total_hits="$(total_hits_from_file "$raw_file")"
 
   local dir_rows=""
   if (( ${#DIR_NAMES[@]} > 0 )); then
@@ -548,9 +554,9 @@ generate_html_report() {
 
   local findings_raw
   if [[ "$HTML_REDACT" == "true" ]]; then
-    findings_raw="$(grep -v '^\[' "$out_file" 2>/dev/null | while IFS= read -r l; do redact_line "$l"; done | html_escape || true)"
+    findings_raw="$(while IFS= read -r l; do [[ -z "$l" ]] && continue; [[ "$l" == \[* ]] && continue; redact_line "$l"; done < "$raw_file" | html_escape || true)"
   else
-    findings_raw="$(grep -v '^\[' "$out_file" 2>/dev/null | html_escape || true)"
+    findings_raw="$(cat "$raw_file" | html_escape || true)"
   fi
 
   local rules_html; rules_html="$(print_context_rules | html_escape | sed 's/$/<br>/' )"
@@ -624,8 +630,8 @@ ${dir_rows:-<tr><td colspan="3" class="muted">No directory stats available.</td>
 
 <div class="card"><h2>🔐 File Access & Ownership</h2>
 <div class="muted">Shows current permissions and ownership for files that produced findings. The chmod/chown commands reproduce current state.</div>
-<table><thead><tr><th>File</th><th>Metadata (chmod / chown)</th></tr></thead><tbody>
-${meta_rows:-<tr><td colspan="2" class="muted">File metadata disabled or no findings.</td></tr>}
+<table><thead><tr><th>File</th><th>Metadata (chmod / chown)</th><th>Hits</th></tr></thead><tbody>
+${meta_rows:-<tr><td colspan="3" class="muted">File metadata disabled or no findings.</td></tr>}
 </tbody></table></div>
 
 <div class="card"><h2>🔎 Findings (raw matches)</h2>
@@ -645,14 +651,6 @@ function filterCtx(level){
 </script>
 </body></html>
 EOF
-}
-
-write_redacted_txt_copy() {
-  local src="$1" dst="$2"
-  : > "$dst"; chmod 600 "$dst"
-  while IFS= read -r line; do
-    if [[ "$line" =~ ^\[ ]]; then echo "$line" >> "$dst"; else redact_line "$line" >> "$dst"; fi
-  done < "$src"
 }
 
 # ================== ARG PARSER ==================
@@ -736,33 +734,41 @@ if [[ "$NON_INTERACTIVE" != "true" ]]; then
   read -rp "Press ENTER to start scanning..."
 fi
 
-OUT_FILE="$SCRIPT_DIR/kredki_found_$(date +%F_%H-%M-%S).txt"
+TS="$(date +%F_%H-%M-%S)"
+RAW_FILE="$SCRIPT_DIR/kredki_found_${TS}.raw.txt"
+REPORT_FILE="$SCRIPT_DIR/kredki_found_${TS}.txt"
 
 echo
-( run_scan "$OUT_FILE" "${EXISTING_DIRS[@]}" ) &
-SCAN_PID=$!
-spinner "$SCAN_PID"
+: > "$RAW_FILE"
+chmod 600 "$RAW_FILE"
 
-TOTAL_S_LINE=$(grep -E '^\[\+\] Total duration:' "$OUT_FILE" 2>/dev/null | tail -n1 | awk '{print $4}' | tr -d 's' || true)
-TOTAL_S="${TOTAL_S_LINE:-0}"
+TOTAL_START=$(date +%s)
+scan_dirs_with_stats "$RAW_FILE" "${EXISTING_DIRS[@]}"
+TOTAL_END=$(date +%s)
+TOTAL_S=$((TOTAL_END - TOTAL_START))
 
-parse_stats_from_output "$OUT_FILE"
-summary "$OUT_FILE" "$TOTAL_S"
+parse_from_raw "$RAW_FILE"
+write_report_txt "$RAW_FILE" "$REPORT_FILE" "$TOTAL_S"
 
-if [[ "$REDACT" == "true" ]]; then
-  REDACT_TXT="${OUT_FILE%.txt}.redacted.txt"
-  write_redacted_txt_copy "$OUT_FILE" "$REDACT_TXT"
-  echo
-  echo -e "${GREEN}🧽 Redacted TXT:${NC} ${CYAN}${REDACT_TXT}${NC}"
-fi
+# Show success
+echo -e "${GREEN}[✔] Scan completed successfully!${NC}"
+echo
+echo -e "${BOLD}📊 Scan Summary${NC}"
+echo -e "────────────────────────────────────────"
+echo -e "📁 Report TXT : ${CYAN}${REPORT_FILE}${NC}"
+echo -e "📁 Raw matches: ${CYAN}${RAW_FILE}${NC}"
+echo -e "⏱️  Total time : ${YELLOW}$(format_duration "$TOTAL_S")${NC}"
+echo -e "🔐 Findings   : ${YELLOW}$(total_hits_from_file "$RAW_FILE")${NC}"
 
+# Optional HTML
 if [[ "$GENERATE_HTML" == "true" ]]; then
-  [[ -z "$HTML_FILE" ]] && HTML_FILE="${OUT_FILE%.txt}.html"
-  generate_html_report "$OUT_FILE" "$TOTAL_S" "$HTML_FILE"
-  echo -e "${GREEN}📄 HTML report:${NC} ${CYAN}${HTML_FILE}${NC}"
+  [[ -z "$HTML_FILE" ]] && HTML_FILE="${REPORT_FILE%.txt}.html"
+  generate_html_report "$RAW_FILE" "$TOTAL_S" "$HTML_FILE"
+  echo -e "📄 HTML       : ${CYAN}${HTML_FILE}${NC}"
 fi
 
 echo
-echo -e "${BLUE}✨ Tip:${NC} Open the result file in a pager:"
-echo -e "   less -R $OUT_FILE"
+echo -e "${BLUE}✨ Tip:${NC}"
+echo -e "  less -R \"$REPORT_FILE\""
+echo -e "  less -R \"$RAW_FILE\""
 echo
