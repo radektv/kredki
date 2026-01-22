@@ -29,7 +29,7 @@ NC='\033[0m'
 SPINNER='|/-\'
 # ===============================================
 
-VERSION="1.8.1"
+VERSION="1.8.2"
 # Host identification (FQDN preferred)
 HOST_FQDN="$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo unknown-host)"
 # Make it filename-safe
@@ -838,7 +838,7 @@ write_report_txt() {
   {
     echo "KREDKI Report"
     echo "Version: $VERSION"
-    echo "Release notes: v1.8.1 – HTML generation hardened (errexit/pipefail safe, populated context blocks)"
+    echo "Release notes: v1.8.2 – HTML generation hardened (errexit/pipefail safe, populated context blocks)"
     echo "Generated: $(date)"
     echo "Host (FQDN): ${HOST_FQDN}"
     echo "OS: $(get_os_pretty)"
@@ -1029,6 +1029,30 @@ generate_html_report() {
   # disable errexit/nounset/pipefail inside this function and restore them on return.
   local __kredki_nounset_was_on=0 __kredki_errexit_was_on=0 __kredki_pipefail_was_on=0
 
+  # --- v1.8.2: RHEL-safe HTML generation ---
+  # HTML is best-effort. Do NOT allow strict Bash flags to abort HTML rendering
+  # on platforms where some commands may return non-zero (e.g., grep no-match, ip variations).
+  local __kredki_restore_opts
+  __kredki_restore_opts="$(set +o)"
+  set +e
+  set +u
+  set +o pipefail
+
+  # Execute a command safely (never fail), return raw output
+  _safe_capture() {
+    local cmd="$1"
+    bash -c "$cmd" 2>/dev/null || true
+  }
+
+  # Execute a command safely and HTML-escape its output.
+  # Note: we avoid putting pipelines inside command substitution to prevent pipefail surprises.
+  _safe_html() {
+    local cmd="$1"
+    local raw
+    raw="$(_safe_capture "$cmd")"
+    printf '%s\n' "$raw" | html_escape
+  }
+
   case "$-" in *u*) __kredki_nounset_was_on=1; set +u ;; esac
   case "$-" in *e*) __kredki_errexit_was_on=1; set +e ;; esac
   if set -o | awk '$1=="pipefail"{exit ($2=="on")?0:1}'; then
@@ -1057,7 +1081,7 @@ partitions="$(get_partitions 2>/dev/null | html_escape || true)"
 local dir_rows=""
   if (( ${#DIR_NAMES[@]} > 0 )); then
     for i in "${!DIR_NAMES[@]}"; do
-      dir_rows+=$'<tr><td><code>'"$(printf '%s' "${DIR_NAMES[$i]}" | html_escape)"$'</code></td><td>'"$(format_duration "${DIR_SECONDS[$i]}")"$'</td><td>'"${DIR_HITS[$i]}"$'</td></tr>\n'
+      dir_rows+=$'<tr><td><code>'"$(_safe_html "printf '%s' \"${DIR_NAMES[$i]}\"")"$'</code></td><td>'"$(format_duration "${DIR_SECONDS[$i]}")"$'</td><td>'"${DIR_HITS[$i]}"$'</td></tr>\n'
     done
   fi
 
@@ -1081,7 +1105,7 @@ local dir_rows=""
   local largest_rows=""
   if [[ $total_hits -gt 0 ]]; then
     while IFS=$'\t' read -r sz f; do
-      largest_rows+="<tr><td><code>$(human_bytes $sz)</code></td><td>${FILE_HITS[$f]:-0}</td><td><code>$(printf '%s' \"$f\" | html_escape)</code></td></tr>\\n"
+      largest_rows+="<tr><td><code>$(human_bytes $sz)</code></td><td>${FILE_HITS[$f]:-0}</td><td><code>$(_safe_html "printf '%s' \\"$f\\"")</code></td></tr>\\n"
     done < <(top_largest_files_with_findings 10) || true
   fi
 
@@ -1091,7 +1115,7 @@ local dir_rows=""
       ctx="${FILE_CTX[$f]:-$(ctx_for_path "$f")}"
       conf="${FILE_CONF[$f]:-LOW}"
       tags="${FILE_TAGS[$f]:-MATCH}"
-      top_rows+="<tr data-risk=\"$s\"><td><b>$s/100</b></td><td><code>$label</code></td><td><code>$ctx</code></td><td><code>$conf</code></td><td><code>$(printf '%s' \"$tags\" | html_escape)</code></td><td><code>$(printf '%s' \"$f\" | html_escape)</code></td></tr>\\n"
+      top_rows+="<tr data-risk=\"$s\"><td><b>$s/100</b></td><td><code>$label</code></td><td><code>$ctx</code></td><td><code>$conf</code></td><td><code>$(_safe_html "printf '%s' \\"$tags\\"")</code></td><td><code>$(_safe_html "printf '%s' \\"$f\\"")</code></td></tr>\\n"
     done < <(top_risk_list 10) || true
   fi
 
@@ -1227,6 +1251,9 @@ function sortMetadataByRisk(){
   const rows = Array.from(tbody.querySelectorAll("tr"));
   rows.sort((a,b)=> (parseInt(b.dataset.risk||"0",10) - parseInt(a.dataset.risk||"0",10)) );
   rows.forEach(r=>tbody.appendChild(r));
+
+  # Restore original shell options
+  eval "$__kredki_restore_opts"
 }
 
 function filterCtx(level){
