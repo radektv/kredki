@@ -29,7 +29,7 @@ NC='\033[0m'
 SPINNER='|/-\'
 # ===============================================
 
-VERSION="1.8"
+VERSION="1.8.1"
 # Host identification (FQDN preferred)
 HOST_FQDN="$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo unknown-host)"
 # Make it filename-safe
@@ -838,7 +838,7 @@ write_report_txt() {
   {
     echo "KREDKI Report"
     echo "Version: $VERSION"
-    echo "Release notes: v1.8 – HTML generation fixed (nounset-safe, populated context blocks, readable <pre>)"
+    echo "Release notes: v1.8.1 – HTML generation hardened (errexit/pipefail safe, populated context blocks)"
     echo "Generated: $(date)"
     echo "Host (FQDN): ${HOST_FQDN}"
     echo "OS: $(get_os_pretty)"
@@ -1023,13 +1023,20 @@ html_meta_rows() {
 
 
 generate_html_report() {
-  # ---- HTML generation must not abort on unset variables (set -u / nounset) ----
-  local __kredki_nounset_was_on=0
-  case "$-" in
-    *u*) __kredki_nounset_was_on=1; set +u ;;
-  esac
-  # Restore nounset on function return
-  trap '(( __kredki_nounset_was_on )) && set -u' RETURN
+  # ---- HTML generation must be best-effort (do not abort the whole scan) ----
+  # On some systems (e.g. RHEL), certain helper commands may return non-zero or partial output.
+  # With `set -euo pipefail` enabled globally, this can abort HTML generation. We temporarily
+  # disable errexit/nounset/pipefail inside this function and restore them on return.
+  local __kredki_nounset_was_on=0 __kredki_errexit_was_on=0 __kredki_pipefail_was_on=0
+
+  case "$-" in *u*) __kredki_nounset_was_on=1; set +u ;; esac
+  case "$-" in *e*) __kredki_errexit_was_on=1; set +e ;; esac
+  if set -o | awk '$1=="pipefail"{exit ($2=="on")?0:1}'; then
+    __kredki_pipefail_was_on=1
+    set +o pipefail
+  fi
+
+  trap '(( __kredki_nounset_was_on )) && set -u; (( __kredki_errexit_was_on )) && set -e; (( __kredki_pipefail_was_on )) && set -o pipefail' RETURN
 
   local raw_file="$1" total_s="$2" html_out="$3"
 local total_hits; total_hits="$(total_hits_from_file "$raw_file")"
