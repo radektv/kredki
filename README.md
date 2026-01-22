@@ -1,99 +1,121 @@
 # 🎨 KREDKI
 
+<p align="center">
+<b>Local security audit & context-aware risk analysis for Linux</b><br/>
+<b>Lokalny audyt bezpieczeństwa i analiza kontekstu ryzyka dla Linuxa</b>
+</p>
+
+---
+
+## 🌍 Language / Język
+
+- 🇬🇧 **English** – main content  
+- 🇵🇱 **Polski** – sections marked with 🇵🇱  
+
+This single README follows common **GitHub open‑source standards**:
+- English as the primary language
+- Polish provided inline for local / regional users
+- One file (`README.md`) rendered directly on the project page
+
+---
+
+## 🔎 What is KREDKI? / Czym są KREDKI?
+
+**KREDKI** is an open‑source tool for **local security auditing and context‑aware analysis**
+of Linux systems.
+
+🇵🇱  
 **KREDKI** to narzędzie open‑source do **lokalnego audytu bezpieczeństwa i analizy kontekstu**
-dla systemów Linux.
+systemów Linux.
 
-Projekt służy do wykrywania **poświadczeń, sekretów i wrażliwych danych**
-(hasła, tokeny API, klucze prywatne itp.)
-**z uwzględnieniem realnego ryzyka ich ekspozycji**.
+It detects **credentials, secrets, and sensitive data** (passwords, API tokens, private keys),
+and evaluates them based on **real‑world exposure and location risk**.
 
-KREDKI zostały zaprojektowane jako narzędzie:
-- ✅ audytowe i defensywne
-- ✅ w pełni lokalne (brak ruchu wychodzącego)
-- ✅ bezpieczne dla produkcji (read‑only)
-- ❌ nie są pentestem
-- ❌ nie wykonują exploitów
-- ❌ nie modyfikują systemu
+🇵🇱  
+Wykrywa **poświadczenia, sekrety i dane wrażliwe** (hasła, tokeny API, klucze prywatne)
+z uwzględnieniem **rzeczywistego ryzyka ich ekspozycji**.
 
-> ⚠️ Uruchamiaj wyłącznie na systemach, których jesteś właścicielem  
-> lub na które posiadasz wyraźną zgodę.
+### Design principles
+- ✅ audit & defensive tool  
+- ✅ fully local (no outbound traffic)  
+- ✅ production‑safe (read‑only)  
+- ❌ not a pentest tool  
+- ❌ no exploitation, no system modification  
 
----
-
-## 🆕 Wersja 1.8 (aktualna)
-
-### Najważniejsze zmiany w v1.8
-
-- ✅ **Stabilne generowanie raportów HTML**
-- ✅ Pełne wypełnianie HTML danymi systemowymi:
-  OS, kernel, CPU, RAM, uptime, sieć, użytkownicy, dyski
-- ✅ Odporność na brakujące zmienne (`set -u` safe)
-- ✅ Naprawione ciche przerywanie skryptu (`set -e`)
-- ✅ Spójna wersja widoczna w:
-  - CLI
-  - raporcie TXT
-  - raporcie HTML
-- ✅ Raport HTML czytelny w Chrome / Firefox / Brave
-
-**Wersja:** `1.8`
+> ⚠️ Run only on systems you own or have explicit permission to audit  
+> ⚠️ Uruchamiaj wyłącznie na systemach, na które masz zgodę
 
 ---
 
-## 📸 Zrzuty ekranu
+## 🆕 Release: v1.8.5 (current)
 
-Pliki znajdują się w katalogu `screenshots/` i są renderowane bezpośrednio przez GitHub.
+### What’s new
+- ✅ Stable HTML report generation (Ubuntu + RHEL 9.x)
+- ✅ RHEL‑safe handling of `df` / broken mounts (`rc=1` tolerated)
+- ✅ TXT and HTML reports always generated (best‑effort)
+- ✅ Separate `*.redacted.txt` when `--redact` is enabled
+- ✅ Correct permissions (`600`) for TXT, HTML and redacted reports
+- ✅ Unified versioning in CLI, TXT and HTML
+- ✅ Hardened Bash logic (`set -euo pipefail` safe)
 
-### 🖥️ Interfejs CLI
+🇵🇱  
+**Najważniejsze zmiany**:
+- stabilne raporty HTML
+- odporność na błędy mountów (RHEL, CIFS, FUSE)
+- osobny plik `*.redacted.txt`
+- poprawne uprawnienia plików raportów
+
+---
+
+## 📸 Screenshots
+
+Images are rendered directly from the `screenshots/` directory.
+
 ![CLI UI](screenshots/ui.png)
-
-### 📊 Podsumowanie skanu
-![Summary](screenshots/summary.png)
-
-### 🔍 Wyniki skanowania
+![Scan summary](screenshots/summary.png)
 ![Results](screenshots/results.png)
-
-### 🧭 Breakdown kontekstu ryzyka
-![Context breakdown](screenshots/context_breakdown.png)
-
-### 📄 Raport HTML
+![Risk context](screenshots/context_breakdown.png)
 ![HTML report](screenshots/html_report.png)
 
 ---
 
-## 🚀 Dlaczego KREDKI?
+## 🚀 Why KREDKI? / Dlaczego KREDKI?
 
-Większość skanerów odpowiada tylko na pytanie:
+Most scanners answer:
 
-> **„Czy gdzieś jest sekret?”**
+> “Is there a secret?”
 
-KREDKI odpowiadają na pytanie istotniejsze:
+KREDKI answers:
 
-> **„Jak duże jest ryzyko tego sekretu w tym konkretnym miejscu?”**
+> **“How risky is this secret in this exact location?”**
 
-| Lokalizacja | Ocena ryzyka |
-|------------|--------------|
-| `/root/.env` | 🔴 WYSOKIE |
-| `/etc/app/config.yml` | 🔴 WYSOKIE |
-| `/home/user/.env` | 🟠 ŚREDNIE |
-| `/tmp/test.txt` | 🟡 NISKIE |
+| Location | Risk |
+|--------|------|
+| `/root/.env` | 🔴 HIGH |
+| `/etc/app/config.yml` | 🔴 HIGH |
+| `/home/user/.env` | 🟠 MEDIUM |
+| `/tmp/test.txt` | 🟡 LOW |
 
----
-
-## ✨ Główne funkcje
-
-- Rekursywne skanowanie systemu plików
-- Bardzo szybkie wyszukiwanie (`ripgrep`)
-- **Kontekst bezpieczeństwa**: HIGH / MEDIUM / LOW
-- Profile środowisk: `default`, `prod`, `dev`, `ctf`
-- **Safe Production Mode**
-- Redakcja sekretów (safe to share)
-- Raport TXT + **raport HTML klasy audytowej**
-- Obsługa `.kredkiignore`
-- Brak agentów, brak chmury, brak telemetrii
+🇵🇱  
+Ten sam sekret w różnych lokalizacjach oznacza **inne ryzyko biznesowe**.
 
 ---
 
-## 📦 Wymagania
+## ✨ Key Features / Funkcje
+
+- Recursive filesystem scanning
+- Very fast matching (`ripgrep`)
+- Context‑based risk scoring (HIGH / MEDIUM / LOW)
+- Profiles: `default`, `prod`, `dev`, `ctf`
+- Safe Production Mode
+- Secret redaction (safe to share)
+- TXT + audit‑grade HTML reports
+- `.kredkiignore` support
+- No agents, no cloud, no telemetry
+
+---
+
+## 📦 Requirements
 
 - Linux
 - `bash` ≥ 4.x
@@ -105,7 +127,7 @@ sudo apt install -y ripgrep
 
 ---
 
-## 📁 Instalacja
+## 📁 Installation
 
 ```bash
 git clone https://github.com/radektv/kredki.git
@@ -115,144 +137,50 @@ chmod +x kredki-ui.sh
 
 ---
 
-## ▶️ Przykładowe użycie (CLI Cookbook)
-
-Poniżej znajdują się **praktyczne scenariusze**, bezpośrednio zgodne z `--help`.
-
----
-
-### 🔍 Podstawowy skan wybranych katalogów
-
-```bash
-./kredki-ui.sh --paths /etc,/home
-```
-
-**Zastosowanie:** szybki audyt konfiguracji systemu i użytkowników.
-
----
-
-### 📄 Generowanie raportu HTML
+## ▶️ Usage Examples (CLI Cookbook)
 
 ```bash
 ./kredki-ui.sh --paths /etc,/home --html
-```
-
-Tworzy:
-- raport TXT
-- raport HTML obok pliku TXT
-
----
-
-### 🛡️ Bezpieczny skan produkcyjny (rekomendowane)
-
-```bash
 ./kredki-ui.sh --profile prod --safe --html
-```
-
-**Cechy:**
-- tylko operacje read‑only
-- konserwatywne limity
-- bezpieczne dla produkcji
-
----
-
-### 🧭 Kontekst per plik (mniej szumu)
-
-```bash
-./kredki-ui.sh --context-mode file
-```
-
-Jeden wpis = jeden plik, niezależnie od liczby dopasowań.
-
----
-
-### 🧾 Raport z redakcją sekretów
-
-```bash
 ./kredki-ui.sh --html --redact --context-mode file
+./kredki-ui.sh --non-interactive --html
 ```
 
-**Idealne do:**
-- udostępniania raportu
-- zgłoszeń audytowych
-- zespołów zewnętrznych
+🇵🇱  
+Przykłady są **w pełni zgodne z `--help`** i gotowe do CI/CD.
 
 ---
 
-### 🤖 Tryb automatyczny / CI
+## 📄 Reports
 
-```bash
-./kredki-ui.sh --non-interactive --html --context-mode file
-```
+Generated files:
+- `kredki_found_*.txt`
+- `kredki_found_*.html`
+- `kredki_found_*.redacted.txt`
 
-Bez promptów, gotowe do pipeline CI/CD.
-
----
-
-### 📂 Nadpisanie ścieżek + limity
-
-```bash
-./kredki-ui.sh \
-  --paths /etc,/var,/srv \
-  --max-filesize 5M \
-  --html
-```
+All reports are created with **permissions `600`**.
 
 ---
 
-### 🚫 Ignorowanie plików i katalogów
+## 🧭 What KREDKI is NOT / Czym KREDKI nie są
 
-```bash
-./kredki-ui.sh --ignore-file /root/.kredkiignore
-```
-
----
-
-## 📄 Raporty
-
-Generowane pliki:
-
-- `kredki_found_<HOST>_<TIMESTAMP>.txt`
-- `kredki_found_<HOST>_<TIMESTAMP>.html`
-- `*.redacted.txt`
-
-Podgląd w terminalu:
-```bash
-less -R kredki_found_*.txt
-w3m kredki_found_*.html
-```
+- ❌ pentest framework
+- ❌ privilege escalation tool
+- ❌ network scanner
+- ❌ SaaS / cloud service
+- ❌ telemetry or data collection agent
 
 ---
 
-## 🔐 Bezpieczeństwo raportów
+## 📜 License
 
-Raporty mogą zawierać dane wrażliwe.
-
-Zalecane uprawnienia:
-```bash
-chmod 600 kredki_found_*
-```
+MIT License — use responsibly.
 
 ---
 
-## 🧭 Czym KREDKI NIE są
+## 🧩 Project Philosophy / Filozofia
 
-- ❌ pentestem
-- ❌ narzędziem do eskalacji uprawnień
-- ❌ skanerem sieci
-- ❌ narzędziem SaaS
-- ❌ systemem telemetrycznym
+> **Security findings without context are just noise.**  
+> 🇵🇱 *Wyniki bezpieczeństwa bez kontekstu to tylko szum.*
 
----
-
-## 📜 Licencja
-
-MIT License — używaj odpowiedzialnie.
-
----
-
-## 🧩 Filozofia projektu
-
-> *„Wyniki bezpieczeństwa bez kontekstu to tylko szum.”*
-
-KREDKI skupiają się na **realnym ryzyku**, a nie na liczbie trafień.
+KREDKI focuses on **meaningful, real‑world risk**, not raw findings.
