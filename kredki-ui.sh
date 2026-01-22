@@ -29,7 +29,7 @@ NC='\033[0m'
 SPINNER='|/-\'
 # ===============================================
 
-VERSION="1.8.2"
+VERSION="1.8.3"
 # Host identification (FQDN preferred)
 HOST_FQDN="$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo unknown-host)"
 # Make it filename-safe
@@ -214,13 +214,34 @@ get_ram_info() {
 }
 
 get_partitions() {
+  # IMPORTANT: `df` may return rc!=0 on some mounts (e.g. FUSE/CIFS "Key has expired")
+  # even if it prints valid output. We must NEVER let this abort report generation.
   if command -v df >/dev/null 2>&1; then
-    # show only real mounts, human-friendly
-    df -hT -x tmpfs -x devtmpfs 2>/dev/null || df -h 2>/dev/null
-  else
-    echo "df not available"
+    local out="" rc=0
+
+    # Prefer df -hT; fall back to df -h if -T is unavailable.
+    # Silence stderr to avoid noisy mount warnings in the report.
+    out="$(df -hT -x tmpfs -x devtmpfs 2>/dev/null)"; rc=$?
+    if [[ -z "$out" ]]; then
+      out="$(df -h -x tmpfs -x devtmpfs 2>/dev/null)"; rc=$?
+    fi
+
+    # If df still produced nothing (very rare), show a minimal message.
+    if [[ -z "$out" ]]; then
+      echo "df produced no output (rc=$rc)"
+      return 0
+    fi
+
+    # Always return success regardless of df rc.
+    printf '%s
+' "$out"
+    return 0
   fi
+
+  echo "df not available"
+  return 0
 }
+
 
 get_uptime_pretty() {
   if command -v uptime >/dev/null 2>&1; then
@@ -838,7 +859,7 @@ write_report_txt() {
   {
     echo "KREDKI Report"
     echo "Version: $VERSION"
-    echo "Release notes: v1.8.2 – HTML generation hardened (errexit/pipefail safe, populated context blocks)"
+    echo "Release notes: v1.8 – HTML generation fixed (nounset-safe, populated context blocks, readable <pre>)"
     echo "Generated: $(date)"
     echo "Host (FQDN): ${HOST_FQDN}"
     echo "OS: $(get_os_pretty)"
@@ -1023,44 +1044,14 @@ html_meta_rows() {
 
 
 generate_html_report() {
-  # ---- HTML generation must be best-effort (do not abort the whole scan) ----
-  # On some systems (e.g. RHEL), certain helper commands may return non-zero or partial output.
-  # With `set -euo pipefail` enabled globally, this can abort HTML generation. We temporarily
-  # disable errexit/nounset/pipefail inside this function and restore them on return.
-  local __kredki_nounset_was_on=0 __kredki_errexit_was_on=0 __kredki_pipefail_was_on=0
-
-  # --- v1.8.2: RHEL-safe HTML generation ---
-  # HTML is best-effort. Do NOT allow strict Bash flags to abort HTML rendering
-  # on platforms where some commands may return non-zero (e.g., grep no-match, ip variations).
-  local __kredki_restore_opts
-  __kredki_restore_opts="$(set +o)"
+  # ---- HTML generation is best-effort: do not abort on `set -euo pipefail` edge cases (RHEL df exit codes, grep no-match, etc.) ----
+  local __kredki_set_state
+  __kredki_set_state="$(set +o)"
   set +e
   set +u
   set +o pipefail
-
-  # Execute a command safely (never fail), return raw output
-  _safe_capture() {
-    local cmd="$1"
-    bash -c "$cmd" 2>/dev/null || true
-  }
-
-  # Execute a command safely and HTML-escape its output.
-  # Note: we avoid putting pipelines inside command substitution to prevent pipefail surprises.
-  _safe_html() {
-    local cmd="$1"
-    local raw
-    raw="$(_safe_capture "$cmd")"
-    printf '%s\n' "$raw" | html_escape
-  }
-
-  case "$-" in *u*) __kredki_nounset_was_on=1; set +u ;; esac
-  case "$-" in *e*) __kredki_errexit_was_on=1; set +e ;; esac
-  if set -o | awk '$1=="pipefail"{exit ($2=="on")?0:1}'; then
-    __kredki_pipefail_was_on=1
-    set +o pipefail
-  fi
-
-  trap '(( __kredki_nounset_was_on )) && set -u; (( __kredki_errexit_was_on )) && set -e; (( __kredki_pipefail_was_on )) && set -o pipefail' RETURN
+  # Restore previous shell options on return
+  trap 'eval "$__kredki_set_state"' RETURN
 
   local raw_file="$1" total_s="$2" html_out="$3"
 local total_hits; total_hits="$(total_hits_from_file "$raw_file")"
@@ -1068,20 +1059,31 @@ local total_hits; total_hits="$(total_hits_from_file "$raw_file")"
 # Precompute system/context blocks for HTML (these are shown in the dashboard).
 # Important: do NOT allow failures here to abort report generation.
 local os_pretty="" kernel="" cpu="" ram="" uptime="" ip="" users="" sudo_summary="" partitions=""
-os_pretty="$(get_os_pretty 2>/dev/null | html_escape || true)"
-kernel="$(get_kernel 2>/dev/null | html_escape || true)"
-cpu="$(get_cpu_info 2>/dev/null | html_escape || true)"
-ram="$(get_ram_info 2>/dev/null | html_escape || true)"
-uptime="$(get_uptime_pretty 2>/dev/null | html_escape || true)"
-ip="$(get_ip_brief 2>/dev/null | html_escape || true)"
-users="$(get_users_summary 2>/dev/null | html_escape || true)"
-sudo_summary="$(get_sudo_summary 2>/dev/null | html_escape || true)"
-partitions="$(get_partitions 2>/dev/null | html_escape || true)"
+local __kredki_tmp=""
+
+__kredki_tmp="$(get_os_pretty 2>/dev/null || true)";      os_pretty="$(printf '%s
+' "$__kredki_tmp" | html_escape)"
+__kredki_tmp="$(get_kernel 2>/dev/null || true)";        kernel="$(printf '%s
+' "$__kredki_tmp" | html_escape)"
+__kredki_tmp="$(get_cpu_info 2>/dev/null || true)";      cpu="$(printf '%s
+' "$__kredki_tmp" | html_escape)"
+__kredki_tmp="$(get_ram_info 2>/dev/null || true)";      ram="$(printf '%s
+' "$__kredki_tmp" | html_escape)"
+__kredki_tmp="$(get_uptime_pretty 2>/dev/null || true)"; uptime="$(printf '%s
+' "$__kredki_tmp" | html_escape)"
+__kredki_tmp="$(get_ip_brief 2>/dev/null || true)";      ip="$(printf '%s
+' "$__kredki_tmp" | html_escape)"
+__kredki_tmp="$(get_users_summary 2>/dev/null || true)"; users="$(printf '%s
+' "$__kredki_tmp" | html_escape)"
+__kredki_tmp="$(get_sudo_summary 2>/dev/null || true)";  sudo_summary="$(printf '%s
+' "$__kredki_tmp" | html_escape)"
+__kredki_tmp="$(get_partitions 2>/dev/null || true)";    partitions="$(printf '%s
+' "$__kredki_tmp" | html_escape)"
 
 local dir_rows=""
   if (( ${#DIR_NAMES[@]} > 0 )); then
     for i in "${!DIR_NAMES[@]}"; do
-      dir_rows+=$'<tr><td><code>'"$(_safe_html "printf '%s' \"${DIR_NAMES[$i]}\"")"$'</code></td><td>'"$(format_duration "${DIR_SECONDS[$i]}")"$'</td><td>'"${DIR_HITS[$i]}"$'</td></tr>\n'
+      dir_rows+=$'<tr><td><code>'"$(printf '%s' "${DIR_NAMES[$i]}" | html_escape)"$'</code></td><td>'"$(format_duration "${DIR_SECONDS[$i]}")"$'</td><td>'"${DIR_HITS[$i]}"$'</td></tr>\n'
     done
   fi
 
@@ -1105,7 +1107,7 @@ local dir_rows=""
   local largest_rows=""
   if [[ $total_hits -gt 0 ]]; then
     while IFS=$'\t' read -r sz f; do
-      largest_rows+="<tr><td><code>$(human_bytes $sz)</code></td><td>${FILE_HITS[$f]:-0}</td><td><code>$(_safe_html "printf '%s' \\"$f\\"")</code></td></tr>\\n"
+      largest_rows+="<tr><td><code>$(human_bytes $sz)</code></td><td>${FILE_HITS[$f]:-0}</td><td><code>$(printf '%s' \"$f\" | html_escape)</code></td></tr>\\n"
     done < <(top_largest_files_with_findings 10) || true
   fi
 
@@ -1115,7 +1117,7 @@ local dir_rows=""
       ctx="${FILE_CTX[$f]:-$(ctx_for_path "$f")}"
       conf="${FILE_CONF[$f]:-LOW}"
       tags="${FILE_TAGS[$f]:-MATCH}"
-      top_rows+="<tr data-risk=\"$s\"><td><b>$s/100</b></td><td><code>$label</code></td><td><code>$ctx</code></td><td><code>$conf</code></td><td><code>$(_safe_html "printf '%s' \\"$tags\\"")</code></td><td><code>$(_safe_html "printf '%s' \\"$f\\"")</code></td></tr>\\n"
+      top_rows+="<tr data-risk=\"$s\"><td><b>$s/100</b></td><td><code>$label</code></td><td><code>$ctx</code></td><td><code>$conf</code></td><td><code>$(printf '%s' \"$tags\" | html_escape)</code></td><td><code>$(printf '%s' \"$f\" | html_escape)</code></td></tr>\\n"
     done < <(top_risk_list 10) || true
   fi
 
@@ -1251,9 +1253,6 @@ function sortMetadataByRisk(){
   const rows = Array.from(tbody.querySelectorAll("tr"));
   rows.sort((a,b)=> (parseInt(b.dataset.risk||"0",10) - parseInt(a.dataset.risk||"0",10)) );
   rows.forEach(r=>tbody.appendChild(r));
-
-  # Restore original shell options
-  eval "$__kredki_restore_opts"
 }
 
 function filterCtx(level){
