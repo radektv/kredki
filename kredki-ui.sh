@@ -29,7 +29,7 @@ NC='\033[0m'
 SPINNER='|/-\'
 # ===============================================
 
-VERSION="1.8.4"
+VERSION="1.8.5"
 # Host identification (FQDN preferred)
 HOST_FQDN="$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo unknown-host)"
 # Make it filename-safe
@@ -214,7 +214,7 @@ get_ram_info() {
 }
 
 get_partitions() {
-  # NOTE (v1.8.4): On some systems (e.g., RHEL with problematic/FUSE/CIFS mounts),
+  # NOTE (v1.8.5): On some systems (e.g., RHEL with problematic/FUSE/CIFS mounts),
   # `df` may print useful output but exit with rc=1 (e.g. "Key has expired").
   # With `set -euo pipefail`, that rc=1 can abort the script and/or break report generation.
   # We therefore:
@@ -1354,7 +1354,23 @@ TOTAL_END=$(date +%s)
 TOTAL_S=$((TOTAL_END - TOTAL_START))
 
 parse_from_raw "$RAW_FILE"
+# Always generate the base (non-redacted) TXT report
+REDACT_ORIG="$REDACT"
+REDACT=false
 write_report_txt "$RAW_FILE" "$REPORT_FILE" "$TOTAL_S"
+chmod 600 "$REPORT_FILE" || true
+
+# If requested, also generate a separate redacted TXT report (*.redacted.txt)
+if [[ "$REDACT_ORIG" == "true" ]]; then
+  REDACT=true
+  REDACTED_REPORT_FILE="${REPORT_FILE%.txt}.redacted.txt"
+  write_report_txt "$RAW_FILE" "$REDACTED_REPORT_FILE" "$TOTAL_S"
+  chmod 600 "$REDACTED_REPORT_FILE" || true
+  # restore for downstream logic (e.g. HTML redaction flags)
+  REDACT="$REDACT_ORIG"
+else
+  REDACT="$REDACT_ORIG"
+fi
 
 # Show success
 echo -e "${GREEN}[✔] Scan completed successfully!${NC}"
@@ -1390,6 +1406,7 @@ if [[ "$GENERATE_HTML" == "true" ]]; then
   if generate_html_report "$RAW_FILE" "$TOTAL_S" "$HTML_FILE"; then
     if [[ -s "$HTML_FILE" ]]; then
       echo -e "📄 HTML       : ${CYAN}${HTML_FILE}${NC}"
+      chmod 600 "$HTML_FILE" || true
     else
       echo -e "${YELLOW}[!]${NC} HTML generator ran but file is empty: ${CYAN}${HTML_FILE}${NC}"
     fi
