@@ -29,7 +29,7 @@ NC='\033[0m'
 SPINNER='|/-\'
 # ===============================================
 
-VERSION="1.8.3"
+VERSION="1.8.4"
 # Host identification (FQDN preferred)
 HOST_FQDN="$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo unknown-host)"
 # Make it filename-safe
@@ -214,31 +214,19 @@ get_ram_info() {
 }
 
 get_partitions() {
-  # IMPORTANT: `df` may return rc!=0 on some mounts (e.g. FUSE/CIFS "Key has expired")
-  # even if it prints valid output. We must NEVER let this abort report generation.
-  if command -v df >/dev/null 2>&1; then
-    local out="" rc=0
-
-    # Prefer df -hT; fall back to df -h if -T is unavailable.
-    # Silence stderr to avoid noisy mount warnings in the report.
-    out="$(df -hT -x tmpfs -x devtmpfs 2>/dev/null)"; rc=$?
-    if [[ -z "$out" ]]; then
-      out="$(df -h -x tmpfs -x devtmpfs 2>/dev/null)"; rc=$?
-    fi
-
-    # If df still produced nothing (very rare), show a minimal message.
-    if [[ -z "$out" ]]; then
-      echo "df produced no output (rc=$rc)"
-      return 0
-    fi
-
-    # Always return success regardless of df rc.
-    printf '%s
-' "$out"
-    return 0
+  # NOTE (v1.8.4): On some systems (e.g., RHEL with problematic/FUSE/CIFS mounts),
+  # `df` may print useful output but exit with rc=1 (e.g. "Key has expired").
+  # With `set -euo pipefail`, that rc=1 can abort the script and/or break report generation.
+  # We therefore:
+  #  - capture stdout regardless of rc (|| true)
+  #  - silence stderr to avoid noisy mount errors in reports
+  #  - always return 0 from this function (best-effort context block)
+  local out=""
+  out="$(df -hT 2>/dev/null || true)"
+  if [[ -z "$out" ]]; then
+    out="$(df -h 2>/dev/null || true)"
   fi
-
-  echo "df not available"
+  printf '%s\n' "$out"
   return 0
 }
 
